@@ -1,0 +1,2 @@
+# gDinoCNClip
+grounding-dino+cnclip
