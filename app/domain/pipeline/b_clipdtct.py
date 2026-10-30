@@ -56,9 +56,6 @@ class ClipDetect:
         for name, value in (("context_length", self.context_length), ("image_size", self.image_size)):
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"CLIP_CONFIG.{name} must be a positive integer")
-        self.logit_scale = float(clip_cfg.get("logit_scale", 1.0))
-        if not np.isfinite(self.logit_scale) or self.logit_scale <= 0:
-            raise ValueError("CLIP_CONFIG.logit_scale must be finite and positive")
         self.threshold = float(clip_cfg.get("threshold", 0.5))
         if not np.isfinite(self.threshold) or not 0 <= self.threshold <= 1:
             raise ValueError("CLIP_CONFIG.threshold must be between zero and one")
@@ -194,7 +191,7 @@ class ClipDetect:
         return self.extract_text_feature_with_model(text_list)
 
     def _similarity_scores(self, image_features, text_features):
-        """Apply sigmoid for one prompt, or scaled softmax for multiple prompts."""
+        """Map normalized image/text cosine similarities from [-1,1] to [0,1]."""
         image_features = np.asarray(image_features, dtype=np.float64)
         text_features = np.asarray(text_features, dtype=np.float64)
         if image_features.ndim == 2 and image_features.shape[0] == 1:
@@ -207,15 +204,10 @@ class ClipDetect:
             raise RuntimeError("CLIP feature extraction returned invalid features")
         if text_features.shape[0] == 0:
             return np.empty(0, dtype=np.float64)
-        if not np.isfinite(self.logit_scale) or self.logit_scale <= 0:
-            raise RuntimeError("CLIP logit_scale must be finite and positive")
-        logits = (text_features @ image_features) * self.logit_scale
-        if not np.isfinite(logits).all():
+        cosine = text_features @ image_features
+        if not np.isfinite(cosine).all():
             raise RuntimeError("CLIP similarity is not finite")
-        if len(logits) == 1:
-            return np.exp(-np.logaddexp(0.0, -logits))
-        exp_x = np.exp(logits - np.max(logits))
-        return exp_x / (exp_x.sum() + 1e-8)
+        return np.clip((cosine + 1.0) / 2.0, 0.0, 1.0)
 
     def _prompt_features(self, text):
         if not isinstance(text, str) or not text.strip():
@@ -228,7 +220,7 @@ class ClipDetect:
 
     def batch_detect(self, image_data: Image.Image, boxes, single_text: str,
                      threshold: Optional[float] = None):
-        """Filter pixel xyxy rectangles by sigmoid scores from the text model."""
+        """Filter pixel xyxy rectangles by mapped cosine similarity scores."""
         boxes = np.asarray(boxes, dtype=np.float32).reshape(-1, 4)
         if len(boxes) == 0:
             return [], []
@@ -254,7 +246,7 @@ class ClipDetect:
         return selected_rects, confidences
 
     def similarity(self, img_bgr: np.ndarray, text: str) -> float:
-        """Return sigmoid(logit_scale * cosine) for a directly encoded prompt."""
+        """Return (cosine + 1) / 2 for a directly encoded text prompt."""
         if not self.ini_flag:
             raise RuntimeError("CLIP model is not initialized")
         text_features = self._prompt_features(text)

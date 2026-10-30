@@ -16,7 +16,6 @@ class ClipFoodFilterChecks(unittest.TestCase):
     def detector(self):
         detector = ClipDetect.__new__(ClipDetect)
         detector.ini_flag = True
-        detector.logit_scale = 2.0
         detector.threshold = 0.5
         detector.topk = 2
         detector.extract_image_feature = Mock(return_value=np.array([[0.6, 0.8]], dtype=np.float32))
@@ -37,7 +36,7 @@ class ClipFoodFilterChecks(unittest.TestCase):
                 "  text_model_path: config/model/clip/text.onnx\n"
                 "  use_gpu: false\n"
                 "  threads: 2\n"
-                "  logit_scale: 2.0\n",
+                "  threshold: 0.5\n",
                 encoding="utf-8",
             )
             for source in (config_path, str(config_path)):
@@ -45,7 +44,7 @@ class ClipFoodFilterChecks(unittest.TestCase):
                     detector = ClipDetect(source)
                 self.assertEqual(detector.provider, "cpu")
                 self.assertEqual(detector.threads, 2)
-                self.assertEqual(detector.logit_scale, 2.0)
+                self.assertEqual(detector.threshold, 0.5)
                 self.assertEqual(Path(detector.model_path),
                                  Path(__file__).resolve().parents[1] / "config/model/clip/image.onnx")
 
@@ -53,32 +52,28 @@ class ClipFoodFilterChecks(unittest.TestCase):
         with patch.object(ClipDetect, "load_image_model", return_value=True) as image, \
                 patch.object(ClipDetect, "load_text_model", return_value=True) as text, \
                 patch("builtins.open", side_effect=AssertionError("No feature files may be read")):
-            detector = ClipDetect({"CLIP_CONFIG": {"use_gpu": False, "logit_scale": 2.0}})
+            detector = ClipDetect({"CLIP_CONFIG": {"use_gpu": False}})
         self.assertTrue(detector.ini_flag)
         image.assert_called_once()
         text.assert_called_once()
 
-    def test_single_prompt_returns_sigmoid_of_scaled_cosine(self):
+    def test_single_prompt_returns_mapped_cosine(self):
         detector = self.detector()
         image = np.zeros((2, 3, 3), dtype=np.uint8)
-        self.assertAlmostEqual(detector.similarity(image, "a new caption"),
-                               1 / (1 + np.exp(-1.2)), places=6)
+        self.assertAlmostEqual(detector.similarity(image, "a new caption"), 0.8, places=6)
         detector.extract_text_feature_with_model.assert_called_once_with(["a new caption"])
-        detector.logit_scale = 1.0
-        self.assertAlmostEqual(detector.similarity(image, "a new caption"),
-                               1 / (1 + np.exp(-0.6)), places=6)
 
-    def test_sigmoid_is_stable_for_negative_zero_and_large_logits(self):
+    def test_mapping_handles_opposite_orthogonal_and_aligned_features(self):
         detector = self.detector()
-        detector.logit_scale = 1000.0
         text = np.array([[1.0, 0.0]])
         with np.errstate(over="raise", invalid="raise"):
             for image, expected in (([[-1.0, 0.0]], 0.0), ([[0.0, 1.0]], 0.5),
-                                    ([[1.0, 0.0]], 1.0)):
+                                    ([[1.0, 0.0]], 1.0), ([[1.0000001, 0.0]], 1.0),
+                                    ([[-1.0000001, 0.0]], 0.0)):
                 with self.subTest(image=image):
                     self.assertEqual(float(detector._similarity_scores(image, text)[0]), expected)
 
-    def test_multiple_candidate_texts_use_softmax_and_rank_labels(self):
+    def test_multiple_candidate_scores_are_independent_and_rank_labels(self):
         detector = self.detector()
         detector.threshold = 0.0
         detector.extract_text_feature_with_model.return_value = (
@@ -87,9 +82,12 @@ class ClipFoodFilterChecks(unittest.TestCase):
         image = np.zeros((2, 2, 3), dtype=np.uint8)
         result = detector.detect(image, ["fish", "shrimp"])
         self.assertEqual([name for name, _ in result], ["shrimp", "fish"])
-        self.assertAlmostEqual(sum(score for _, score in result), 1.0, places=7)
-        self.assertAlmostEqual(result[0][1], 1 / (1 + np.exp(-0.4)), places=6)
+        np.testing.assert_allclose([score for _, score in result], [0.9, 0.8], rtol=1e-6)
         self.assertEqual(result, detector.detect_with_text_model(image, ["fish", "shrimp"]))
+        detector.extract_text_feature_with_model.return_value = (
+            ["fish"], np.array([[1.0, 0.0]], dtype=np.float32),
+        )
+        self.assertAlmostEqual(result[1][1], detector.similarity(image, "fish"), places=6)
 
     def test_batch_encodes_prompt_once_and_filters_each_crop_independently(self):
         detector = self.detector()
@@ -103,7 +101,7 @@ class ClipFoodFilterChecks(unittest.TestCase):
         expected_rects = [[3, 2, 7, 6], [-1, 2, 1, 6], [7, 0, 9, 4]]
         rects, scores = detector.batch_detect(image, boxes, "fish", 0.5)
         self.assertEqual(rects, [expected_rects[1]])
-        self.assertAlmostEqual(scores[0], 1 / (1 + np.exp(-1.2)), places=6)
+        self.assertAlmostEqual(scores[0], 0.8, places=6)
         detector.extract_text_feature_with_model.assert_called_once_with(["fish"])
         for call, rect in zip(detector.extract_image_feature.call_args_list, expected_rects):
             crop = call.args[0]

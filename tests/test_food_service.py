@@ -47,7 +47,7 @@ class FoodServiceChecks(unittest.TestCase):
                 self.assertEqual(image.mode, "RGB")
                 np.testing.assert_array_equal(np.asarray(image), self.pixels)
 
-    def test_positive_clip_threshold_delegates_full_box_array_and_sigmoid_threshold(self):
+    def test_positive_clip_threshold_delegates_full_box_array_and_mapped_threshold(self):
         detector = self.detector()
         self.clip.batch_detect.return_value = ([self.rects[1]], [0.75])
         result = detector.detect(self.image_bytes, "food", 0.3, 0.4, "三文鱼", 0.5)

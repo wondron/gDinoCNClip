@@ -234,9 +234,9 @@ response.raise_for_status()
 print(response.json())
 ```
 
-`clip_thre > 0` 时，对每个 DINO 框裁剪图像，直接用 CLIP text model 编码 `clip_cap`，计算 `sigmoid(logit_scale × 图文特征点积)`，只保留分数严格大于 `clip_thre` 的框。文本特征在一批检测框中仅推理一次，无需特征库或 JSONL 文件。分数范围为 `0～1`，例如使用阈值 `0.5`；旧的 `21` 这类原始分数阈值会返回 422。CLIP 随 `Detector` 一起初始化，读取 YAML 的 `CLIP_CONFIG.model_path`、`text_model_path`、`logit_scale` 和 `use_gpu`。
+`clip_thre > 0` 时，对每个 DINO 框裁剪图像，直接用 CLIP text model 编码 `clip_cap`。图文特征归一化后计算余弦相似度，使用 `clip((cosine + 1) / 2, 0, 1)` 作为分数，只保留分数严格大于 `clip_thre` 的框。文本特征在一批检测框中仅推理一次，无需特征库或 JSONL 文件。分数范围为 `0～1`；旧的 `21` 这类原始分数阈值会返回 422。CLIP 随 `Detector` 一起初始化，读取 YAML 的 `CLIP_CONFIG.model_path`、`text_model_path` 和 `use_gpu`。
 
-`similarity()` 和 `batch_detect()` 使用单文本 sigmoid；`detect()`、`detect_with_text_model()` 传入多个文本时，对 text model 实时提取的特征计算 softmax。文本不需要预先登记。`logit_scale` 保留当前模型的原始缩放值 `95.83539581298828`，较大的正负 logits 会使 sigmoid 分数接近 1 或 0；这些分数未经概率校准，阈值应结合实际样本调整。
+`similarity()`、`batch_detect()`、`detect()` 和 `detect_with_text_model()` 使用相同的余弦线性映射，不再使用 `logit_scale`、sigmoid 或 softmax。多文本的分数分别计算，增加候选文本不会改变已有文本的分数，排序与余弦相似度一致。例如余弦值 `0.6` 映射为 `0.8`；阈值 `0.5` 对应原始余弦值 `0`。这些分数表示相似度，未经概率校准，阈值应结合实际样本调整。
 
 `clip_thre <= 0` 时跳过 CLIP，仅保留 DINO 短语包含 `dino_cap` 的框，比较区分大小写，返回的每个置信度固定为 `0.6`。两种模式均返回整数像素坐标 `[x1, y1, x2, y2]`，不增加 NMS，转换时保留参考项目的边界坐标。
 
