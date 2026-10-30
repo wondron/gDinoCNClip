@@ -1,4 +1,4 @@
-# Linux x86_64 GPU deployment (Python 3.10, glibc >= 2.27).
+# Linux x86_64 GPU deployment (Python 3.10/3.11, glibc >= 2.27).
 # ONNX Runtime 1.19.2 uses CUDA 12.x and cuDNN 9.x.
 fastapi==0.135.3
 uvicorn==0.30.6

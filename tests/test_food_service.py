@@ -47,16 +47,16 @@ class FoodServiceChecks(unittest.TestCase):
                 self.assertEqual(image.mode, "RGB")
                 np.testing.assert_array_equal(np.asarray(image), self.pixels)
 
-    def test_positive_clip_threshold_delegates_full_box_array_and_raw_threshold(self):
+    def test_positive_clip_threshold_delegates_full_box_array_and_sigmoid_threshold(self):
         detector = self.detector()
-        self.clip.batch_detect.return_value = ([self.rects[1]], [21.25])
-        result = detector.detect(self.image_bytes, "food", 0.3, 0.4, "三文鱼", 21)
-        self.assertEqual(result, ([self.rects[1]], [21.25]))
+        self.clip.batch_detect.return_value = ([self.rects[1]], [0.75])
+        result = detector.detect(self.image_bytes, "food", 0.3, 0.4, "三文鱼", 0.5)
+        self.assertEqual(result, ([self.rects[1]], [0.75]))
         self.clip.batch_detect.assert_called_once()
         image, boxes, caption, threshold = self.clip.batch_detect.call_args.args
         np.testing.assert_array_equal(np.asarray(image), self.pixels)
         np.testing.assert_array_equal(boxes, self.boxes)
-        self.assertEqual((caption, threshold), ("三文鱼", 21))
+        self.assertEqual((caption, threshold), ("三文鱼", 0.5))
 
     def test_empty_numpy_boxes_support_both_detection_branches(self):
         self.gdino.detect.return_value = (np.empty((0, 4), dtype=np.float32),
@@ -65,17 +65,17 @@ class FoodServiceChecks(unittest.TestCase):
         detector = self.detector()
         self.assertEqual(detector.detect(self.image_bytes, "food", 0.3, 0.4, "鱼", 0), ([], []))
         self.clip.batch_detect.assert_not_called()
-        self.assertEqual(detector.detect(self.image_bytes, "food", 0.3, 0.4, "鱼", 21), ([], []))
+        self.assertEqual(detector.detect(self.image_bytes, "food", 0.3, 0.4, "鱼", 0.5), ([], []))
         self.assertEqual(self.clip.batch_detect.call_args.args[1].shape, (0, 4))
 
     def test_configuration_path_initializes_models_once_for_multiple_requests(self):
-        self.clip.batch_detect.return_value = (self.rects, [30.0] * 3)
+        self.clip.batch_detect.return_value = (self.rects, [0.8] * 3)
         with patch("app.domain.food_service.GdinoDetect", return_value=self.gdino) as create_dino, \
                 patch("app.domain.food_service.ClipDetect", return_value=self.clip) as create_clip:
             detector = Detector("config/param/config.yaml")
-            first = detector.detect(self.image_bytes, "food", 0.3, 0.4, "鱼", 21)
-            second = detector.detect(self.image_bytes, "food", 0.3, 0.4, "鱼", 25)
-        self.assertEqual(first, (self.rects, [30.0] * 3))
+            first = detector.detect(self.image_bytes, "food", 0.3, 0.4, "鱼", 0.5)
+            second = detector.detect(self.image_bytes, "food", 0.3, 0.4, "鱼", 0.7)
+        self.assertEqual(first, (self.rects, [0.8] * 3))
         self.assertEqual(second, first)
         create_dino.assert_called_once_with("config/param/config.yaml")
         create_clip.assert_called_once_with("config/param/config.yaml")
@@ -83,7 +83,7 @@ class FoodServiceChecks(unittest.TestCase):
     def test_bad_images_and_inference_failures_return_reference_empty_results(self):
         detector = self.detector()
         with patch("builtins.print"):
-            self.assertEqual(detector.detect(b"not an image", "food", 0.3, 0.4, "鱼", 21),
+            self.assertEqual(detector.detect(b"not an image", "food", 0.3, 0.4, "鱼", 0.5),
                              ([], []))
         self.gdino.detect.assert_not_called()
         self.clip.batch_detect.assert_not_called()

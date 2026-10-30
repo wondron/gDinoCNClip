@@ -1,9 +1,14 @@
 from app.domain.pipeline.a_gdinoDtct import GdinoDetect
 from app.domain.pipeline.b_clipdtct import ClipDetect
 from app.domain.common.image_utils import box2xyxy
+from app.domain.common.timer_utils import timer_tool
+from app.core.observability.log_helper import show_text
+import logging
 import io, time
 from PIL import Image
 
+
+logger = logging.getLogger("food_service")
 
 
 class Detector:
@@ -23,12 +28,18 @@ class Detector:
         
     def detect(self, image_data, dino_caption, dino_box_thre, dino_text_thre, clip_caption, clip_thre):
         try:
+            timer = timer_tool()
             image = Image.open(io.BytesIO(image_data)).convert("RGB")
+            timer.mark("load image")
             boxes, _, parases = self.dino.detect(image, dino_caption, dino_box_thre, dino_text_thre) 
+            timer.mark("dino detect")
             if clip_thre <= 0:
                 rects, confident = self.gDino_filter(image, boxes, parases, dino_caption)
                 return rects, confident
             rects, confident = self.clip.batch_detect(image, boxes, clip_caption, clip_thre)  
+            timer.mark("clip detect")
+            logging.info(f"{timer.summary()}")
+            show_text(timer.summary())
             return rects, confident
         except Exception as e:
             print(f"An error occurred: {e}")
@@ -36,11 +47,11 @@ class Detector:
 
     
 if __name__ == '__main__':
-    detector = Detector('config/config.yaml')
-    image_path = 'images/dddd.jpg'
+    detector = Detector('config/param/config.yaml')
+    image_path = 'config/images/test.jpg'
     image_data = open(image_path, 'rb').read()
     start_time = time.time()  # 记录开始时间
-    rect, confident = detector.detect(image_data, 'food', 0.3, 0.4, '', 10)
+    rect, confident = detector.detect(image_data, 'food', 0.3, 0.4, '食物', 0.5)
     end_time = time.time()  # 记录结束时间
     # 将检测结果可视化
     from PIL import ImageDraw

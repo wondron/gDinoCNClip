@@ -22,7 +22,7 @@ async def food_detect(
     dino_box: float = Form(...),
     dino_text: float = Form(...),
     clip_cap: str = Form(...),
-    clip_thre: float = Form(...),
+    clip_thre: float = Form(..., le=1),
 ):
     if image is None or not image.content_type or not image.content_type.startswith("image/"):
         return JSONResponse(content={"error": "Uploaded file is not an image"}, status_code=400)

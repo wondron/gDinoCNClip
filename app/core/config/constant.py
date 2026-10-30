@@ -12,7 +12,7 @@ VERSION = "1.0.0"
 APP_ENV = "dev"
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8678
-APP_RELOAD = False
+APP_RELOAD = True
 DEFAULT_YAML_PATH = "config/param/config.yaml"
 
 LOGGER_NAME = "roki_ai_food_detector"

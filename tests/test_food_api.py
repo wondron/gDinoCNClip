@@ -16,13 +16,13 @@ from app.domain.food_service import Detector
 
 
 FORM = {"dino_cap": "food", "dino_box": "0.3", "dino_text": "0.4",
-        "clip_cap": "鱼", "clip_thre": "21"}
+        "clip_cap": "鱼", "clip_thre": "0.5"}
 
 
 class FoodApiChecks(unittest.TestCase):
     def setUp(self):
         self.service = Mock()
-        self.service.detect.return_value = ([[1, 2, 7, 8]], [23.5])
+        self.service.detect.return_value = ([[1, 2, 7, 8]], [0.75])
         app = FastAPI()
         app.include_router(router)
         app.state.runtime = SimpleNamespace(food_service=self.service)
@@ -41,8 +41,12 @@ class FoodApiChecks(unittest.TestCase):
     def test_original_bytes_and_all_parameters_reach_service(self):
         response = self._post()
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), {"rects": "[[1, 2, 7, 8]]", "conf": "[23.5]"})
-        self.service.detect.assert_called_once_with(self.image_bytes, "food", 0.3, 0.4, "鱼", 21.0)
+        self.assertEqual(response.json(), {"rects": "[[1, 2, 7, 8]]", "conf": "[0.75]"})
+        self.service.detect.assert_called_once_with(self.image_bytes, "food", 0.3, 0.4, "鱼", 0.5)
+
+    def test_old_raw_score_threshold_is_rejected(self):
+        self.assertEqual(self._post(data={**FORM, "clip_thre": "21"}).status_code, 422)
+        self.service.detect.assert_not_called()
 
     def test_all_fields_are_required_and_numbers_must_parse(self):
         for field in ("image", *FORM):

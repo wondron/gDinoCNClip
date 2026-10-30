@@ -18,7 +18,7 @@ class TraceFilter(logging.Filter):
 
 class CustomFormatter(logging.Formatter):
     def __init__(self, app_settings=settings):
-        super().__init__("{asctime} | {levelname:<5} | {name:^15} | {message}", style="{")
+        super().__init__("{asctime} | {levelname:<4.4} | {name:^15} | {message}", style="{")
         self.tz = timezone(timedelta(hours=app_settings.logging.timezone_offset_hours))
 
     def formatTime(self, record, datefmt=None):

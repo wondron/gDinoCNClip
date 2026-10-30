@@ -1,14 +1,21 @@
-import os, cv2, time, json
+"""Chinese CLIP inference using the image and text ONNX models."""
+
 import logging
+import os
+import time
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import cv2
 import numpy as np
 from PIL import Image
-from typing import Dict, Optional, Tuple, Any, List
+
 import app.domain.common.tokenizer as tokenizer
 from app.domain.common.image_utils import box2xyxy
 from app.domain.pipeline.a_gdinoDtct import create_session
 
 logger = logging.getLogger("clip")
+
 
 class ClipDetect:
     def __init__(self, config_data: Dict[str, Any] | str | os.PathLike):
@@ -19,8 +26,7 @@ class ClipDetect:
         self._load_config(config_data)
         self.init_model()
 
-
-    def _load_config(self, config: Dict[str, Any]):
+    def _load_config(self, config):
         clip_cfg = config.get("CLIP_CONFIG", {})
         total_cfg = config.get("TOTAL_CONFIG", {})
         if not isinstance(clip_cfg, dict) or not isinstance(total_cfg, dict):
@@ -34,169 +40,82 @@ class ClipDetect:
             path = Path(value).expanduser()
             return str((path if path.is_absolute() else project_root / path).resolve())
 
-        self.model_path = configured_path('model_path')
-        self.text_model_path = configured_path('text_model_path')
-        self.text_path = configured_path('text_path')
-        self.use_gpu = clip_cfg.get('use_gpu', True)
+        self.model_path = configured_path("model_path")
+        self.text_model_path = configured_path("text_model_path")
+        self.use_gpu = clip_cfg.get("use_gpu", True)
         if not isinstance(self.use_gpu, bool):
             raise ValueError("CLIP_CONFIG.use_gpu must be true or false")
-        self.provider = 'cuda' if self.use_gpu else 'cpu'
-        self.device_id = total_cfg.get('device_id', 0)
-        self.threads = clip_cfg.get('threads', 4)
-        for name, value in (('device_id', self.device_id), ('threads', self.threads)):
+        self.provider = "cuda" if self.use_gpu else "cpu"
+        self.device_id = total_cfg.get("device_id", 0)
+        self.threads = clip_cfg.get("threads", 4)
+        for name, value in (("device_id", self.device_id), ("threads", self.threads)):
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"{name} must be a nonnegative integer")
-        self.context_length = clip_cfg.get('context_length', 52)
-        self.image_size = clip_cfg.get('image_size', 224)
-        for name, value in (('context_length', self.context_length), ('image_size', self.image_size)):
+        self.context_length = clip_cfg.get("context_length", 52)
+        self.image_size = clip_cfg.get("image_size", 224)
+        for name, value in (("context_length", self.context_length), ("image_size", self.image_size)):
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"CLIP_CONFIG.{name} must be a positive integer")
-        self.verify_text_features = clip_cfg.get('verify_text_features', False)
-        if not isinstance(self.verify_text_features, bool):
-            raise ValueError("CLIP_CONFIG.verify_text_features must be true or false")
-        self.threshold = clip_cfg.get('threshold', 0.02)
-        self.topk = clip_cfg.get('topk', 5)
-
-
-    def isRangeInFeatures(self, FoodList:List):
-        if len(FoodList) == 0:
-            logger.warning("未检测到需要检测的范围食材！")
-            return False
-
-        exclude_range = []
-        for food in FoodList:
-            if food not in self.texts:
-                exclude_range.append(food)
-        if len(exclude_range) > 0:
-            show_msg = "、".join(exclude_range)
-            logger.warning(f"{show_msg}, 不在特征库中！")
-            return False
-        return True
-
-
-    def warmup(self, runs: int = 3) -> None:
-        t0 = time.time()
-        height = self.shape[2] if isinstance(self.shape[2], int) and self.shape[2] > 0 else self.image_size
-        width = self.shape[3] if isinstance(self.shape[3], int) and self.shape[3] > 0 else self.image_size
-        dummy = np.zeros((height, width, 3), dtype=np.uint8)
-        for _ in range(max(1, runs)):
-            self.detect(dummy)
-        logger.info("预热完成, 次数: %d, 耗时: %.2fs", runs, time.time() - t0)
-    
+        self.logit_scale = float(clip_cfg.get("logit_scale", 1.0))
+        if not np.isfinite(self.logit_scale) or self.logit_scale <= 0:
+            raise ValueError("CLIP_CONFIG.logit_scale must be finite and positive")
+        self.threshold = float(clip_cfg.get("threshold", 0.5))
+        if not np.isfinite(self.threshold) or not 0 <= self.threshold <= 1:
+            raise ValueError("CLIP_CONFIG.threshold must be between zero and one")
+        self.topk = clip_cfg.get("topk", 5)
 
     def get_providers(self):
         return ["CUDAExecutionProvider" if self.use_gpu else "CPUExecutionProvider"]
 
-
     def init_model(self):
         self.ini_flag = False
-        self.feats_with_text_model = {}
-        if not (self.load_text_feature() and self.load_image_model() and self.load_text_model()):
-            logger.error("CLIP模型初始化失败！")
-            return
-        self.ini_flag = True
-        # Full feature-bank verification is a diagnostic, not needed for a
-        # request's arbitrary CLIP caption or the cached-feature detect method.
-        if self.verify_text_features:
-            self.ini_flag = self.init_textRange_with_text_model() and self.debug_compare_text_features()
+        self.ini_flag = self.load_image_model() and self.load_text_model()
         if self.ini_flag:
-            logger.info('CLIP模型初始化完成！')
-    
+            logger.info("CLIP模型初始化完成！")
+        else:
+            logger.error("CLIP模型初始化失败！")
 
-    def init_textRange_with_text_model(self):
+    def warmup(self, runs=3):
+        height = self.shape[2] if isinstance(self.shape[2], int) and self.shape[2] > 0 else self.image_size
+        width = self.shape[3] if isinstance(self.shape[3], int) and self.shape[3] > 0 else self.image_size
+        dummy = np.zeros((height, width, 3), dtype=np.uint8)
+        started = time.perf_counter()
+        for _ in range(max(1, runs)):
+            self.extract_image_feature(dummy)
+            self.extract_text_feature_with_model(["warmup"])
+        logger.info("预热完成 | runs=%d | cost_ms=%.2f", max(1, runs),
+                    (time.perf_counter() - started) * 1000)
+
+    def load_image_model(self):
         try:
-            self.feats_with_text_model = {}
-
-            for text in self.texts:
-                _, feat = self.extract_text_feature_with_model([text])
-                if feat.shape[0] == 1:
-                    self.feats_with_text_model[text] = feat[0]
-                else:
-                    logger.error(f"使用文本模型提取文本特征失败: {text}")
-                
-            logger.info(f"使用文本模型提取文本特征完成，数量：{len(self.feats_with_text_model)}")
+            if not self.model_path or not os.path.isfile(self.model_path):
+                raise FileNotFoundError(f"CLIP model not found: {self.model_path}")
+            self.sess = create_session(self.model_path, self.provider, self.threads, device_id=self.device_id)
+            self.input_name = self.sess.get_inputs()[0].name
+            self.output_name = self.sess.get_outputs()[0].name
+            self.shape = self.sess.get_inputs()[0].shape
+            logger.info("clip imgs 输入名：%s", self.input_name)
+            logger.info("clip imgs 输出名：%s", self.output_name)
             return True
-        except Exception as e:
-            logger.error(f"使用文本模型提取文本特征失败！{e}")
+        except Exception as exc:
+            logger.error("加载CLIP图像模型失败：%s", exc)
             return False
-
-
-    def load_text_feature(self):
-        try:
-            if not os.path.exists(self.text_path):
-                logger.error(f"CLIP 文本特征文件：{self.text_path} 不存在！")
-                return False
-            
-            self.texts = []
-            self.feats = []
-            self.logit_scale = None
-            with open(self.text_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    if not line.strip():
-                        continue
-                    entry = json.loads(line.strip())
-                    self.texts.append(entry["text"])
-                    self.feats.append(entry["feature"])
-                    if self.logit_scale is None and "logit_scale" in entry:
-                        self.logit_scale = float(entry["logit_scale"])
-            
-            self.feats = np.asarray(self.feats, dtype=np.float32)
-            if self.feats.ndim != 2 or not self.feats.size or not np.isfinite(self.feats).all():
-                raise ValueError("CLIP text features must be a nonempty finite matrix")
-            self.feats = self.feats / (np.linalg.norm(self.feats, axis=-1, keepdims=True) + 1e-7)
-            if self.logit_scale is None:
-                self.logit_scale = 1.0
-            if not np.isfinite(self.logit_scale) or self.logit_scale <= 0:
-                raise ValueError("CLIP logit_scale must be finite and positive")
-
-            logger.info(f"类别数量：{len(self.texts)}")
-            logger.info(f"文本特征维度：{self.feats.shape[1]}")
-            logger.info(f"logit_scale: {self.logit_scale:.4f}")
-            return True
-        except Exception as e:
-            logger.error(f"加载CLIP文本特征文件失败！{e}")
-            return False
-
 
     def load_text_model(self):
         try:
-            if not os.path.exists(self.text_model_path):
-                logger.error(f"CLIP 文本模型文件：{self.text_model_path} 不存在！")
-                return False
+            if not self.text_model_path or not os.path.isfile(self.text_model_path):
+                raise FileNotFoundError(f"CLIP text model not found: {self.text_model_path}")
             self.text_sess = create_session(self.text_model_path, self.provider, self.threads,
                                             device_id=self.device_id)
             self.text_input_name = self.text_sess.get_inputs()[0].name
             self.text_output_name = self.text_sess.get_outputs()[0].name
             self.text_shape = self.text_sess.get_inputs()[0].shape
-            logger.info(f'clip text 输入名：{self.text_input_name}')
-            logger.info(f'clip text 输出名：{self.text_output_name}')
+            logger.info("clip text 输入名：%s", self.text_input_name)
+            logger.info("clip text 输出名：%s", self.text_output_name)
             return True
-        except Exception as e:
-            logger.error(f"加载CLIP文本模型失败！{e}")
+        except Exception as exc:
+            logger.error("加载CLIP文本模型失败：%s", exc)
             return False
-
-
-    def load_image_model(self):
-        try:
-            if not os.path.exists(self.model_path):
-                logger.error(f"CLIP 模型文件：{self.model_path} 不存在！")
-                return False
-
-            self.sess = create_session(self.model_path, self.provider, self.threads,
-                                       device_id=self.device_id)
-
-            self.input_name = self.sess.get_inputs()[0].name
-            self.output_name = self.sess.get_outputs()[0].name
-            self.shape = self.sess.get_inputs()[0].shape
-
-            logger.info(f'clip imgs 输入名：{self.input_name}')
-            logger.info(f'clip imgs 输出名：{self.output_name}')
-
-            return True
-        except Exception as e:
-            logger.error(f"加载CLIP模型失败！{e}")
-            return False
-
 
     def preprocess_image(self, img_bgr, *, reference=False):
         try:
@@ -206,8 +125,6 @@ class ClipDetect:
             height = self.shape[2] if isinstance(self.shape[2], int) and self.shape[2] > 0 else self.image_size
             width = self.shape[3] if isinstance(self.shape[3], int) and self.shape[3] > 0 else self.image_size
             if reference:
-                # Match Chinese-CLIP's Resize(shorter side, BICUBIC) followed
-                # by CenterCrop, preserving the proposal's aspect ratio.
                 image = Image.fromarray(np.ascontiguousarray(img_bgr[:, :, ::-1]))
                 source_width, source_height = image.size
                 side = max(width, height)
@@ -224,312 +141,155 @@ class ClipDetect:
                 img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             img = img.astype(np.float32) / 255.0
             mean = np.array([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)
-            std  = np.array([0.26862954, 0.26130258, 0.27577711], dtype=np.float32)
-            img = (img - mean) / std  # [H, W, 3]
-            img = img.transpose(2, 0, 1)  # [3, H, W]
-            img = np.expand_dims(img, 0).astype(np.float32)  # [1, 3, H, W]
-            return img
-        except Exception as e:
-            logger.error(f"图片处理失败！{e}")
+            std = np.array([0.26862954, 0.26130258, 0.27577711], dtype=np.float32)
+            img = (img - mean) / std
+            return np.ascontiguousarray(img.transpose(2, 0, 1)[None])
+        except Exception as exc:
+            logger.error("图片处理失败：%s", exc)
             return None
 
-
-    def extract_image_feature(self, img: np.ndarray, *, reference=False):
+    def extract_image_feature(self, img, *, reference=False):
         try:
             if not self.ini_flag:
-                logger.error("初始化未成功, 无法就行图像特征提取！")
+                raise RuntimeError("CLIP model is not initialized")
+            pixels = self.preprocess_image(img, reference=reference)
+            if pixels is None:
                 return None
-            img = self.preprocess_image(img, reference=reference)
-            if img is None:
-                return None
-            feats = self.sess.run([self.output_name], {self.input_name: img})[0]
-            feats = feats / (np.linalg.norm(feats, axis=-1, keepdims=True) + 1e-7)
-            return feats
-        except Exception as e:
-            logger.error(f"CLIP模型输入图片处理失败！{e}")
+            features = self.sess.run([self.output_name], {self.input_name: pixels})[0]
+            return features / (np.linalg.norm(features, axis=-1, keepdims=True) + 1e-7)
+        except Exception as exc:
+            logger.error("CLIP图像特征提取失败：%s", exc)
             return None
 
-
-    def extract_text_feature(self, text_list=None):
-        idx_list = []
-        feat_list = []
-        text_features = None
-
-        if text_list is None or len(text_list) == 0:
-            idx_list = list(range(len(self.texts)))
-            text_features = self.feats
-            return idx_list, text_features
-        
-        for text in text_list:
-            if text not in self.texts:
-                logger.error(f"文本：{text} 不在 CLIP 模型文本列表中！")
-                continue
-            idx = self.texts.index(text)
-            idx_list.append(idx)
-            feat_list.append(self.feats[idx])
-        if not idx_list:
-            logger.error("给定 text_list 中没有任何合法文本，返回空结果。")
-            return [], np.empty((0, self.feats.shape[1]), dtype=self.feats.dtype)
-        text_features = np.stack(feat_list, axis=0)  # [N, dim]
-        return idx_list, text_features
-
-
     def extract_text_feature_with_model(self, text_list=None):
-        """
-        使用 ONNX 文本模型提取文本特征。
-        返回 (idx_list, text_features)，结构与 extract_text_feature 完全一致。
-        """
-        if text_list is None or len(text_list) == 0:
-            text_list = self.texts
-
-        if not text_list:
-            logger.error("给定 text_list 中没有任何合法文本，返回空结果。")
-            return [], np.empty((0, self.feats.shape[1]), dtype=self.feats.dtype)
-
+        """Encode the supplied text directly; no stored text features are used."""
+        if isinstance(text_list, str):
+            text_list = [text_list]
+        if (not isinstance(text_list, (list, tuple)) or not text_list
+                or any(not isinstance(text, str) or not text.strip() for text in text_list)):
+            raise ValueError("Provide one or more nonempty CLIP text prompts")
+        text_list = [text.strip() for text in text_list]
         seq_len = self.text_shape[1] if len(self.text_shape) > 1 else self.context_length
         if not isinstance(seq_len, int) or seq_len < 1:
             seq_len = self.context_length
-        tokens_list = tokenizer.tokenize(text_list, context_length=seq_len) 
-        tokens = np.array(tokens_list, dtype=np.int64)  # [N, seq_len]
-        batch_size = tokens.shape[0]
-        expected_bs = self.text_shape[0]  # 可能是 1 / 'batch' / None
-        try:
-            if not isinstance(expected_bs, int) or expected_bs in (0, -1):
-                output = self.text_sess.run(
-                    [self.text_output_name],
-                    {self.text_input_name: tokens}
-                )[0]  # [N, dim]
+        tokens = np.asarray(tokenizer.tokenize(text_list, context_length=seq_len), dtype=np.int64)
+        expected_bs = self.text_shape[0]
+        if not isinstance(expected_bs, int) or expected_bs in (0, -1) or expected_bs == len(tokens):
+            features = self.text_sess.run([self.text_output_name], {self.text_input_name: tokens})[0]
+        elif expected_bs == 1:
+            features = np.concatenate([
+                self.text_sess.run([self.text_output_name], {self.text_input_name: row[None]})[0]
+                for row in tokens
+            ], axis=0)
+        else:
+            raise ValueError(f"CLIP text model expects batch {expected_bs}, got {len(tokens)}")
+        features = np.asarray(features, dtype=np.float32)
+        if (features.ndim != 2 or features.shape[0] != len(text_list) or features.shape[1] == 0
+                or not np.isfinite(features).all() or np.any(np.linalg.norm(features, axis=1) == 0)):
+            raise RuntimeError("CLIP text model returned invalid features")
+        features /= np.linalg.norm(features, axis=-1, keepdims=True) + 1e-7
+        return text_list, features
 
-            elif isinstance(expected_bs, int) and expected_bs == batch_size:
-                output = self.text_sess.run(
-                    [self.text_output_name],
-                    {self.text_input_name: tokens}
-                )[0]  # [N, dim]
+    def extract_text_feature(self, text_list=None):
+        return self.extract_text_feature_with_model(text_list)
 
-            elif isinstance(expected_bs, int) and expected_bs == 1 and batch_size > 1:
-                feat_list = []
-                for i in range(batch_size):
-                    single_tokens = tokens[i:i+1]  # [1, seq_len]
-                    single_out = self.text_sess.run(
-                        [self.text_output_name],
-                        {self.text_input_name: single_tokens}
-                    )[0]  # [1, dim]
-                    feat_list.append(single_out[0])  # 取掉 batch 维
+    def _similarity_scores(self, image_features, text_features):
+        """Apply sigmoid for one prompt, or scaled softmax for multiple prompts."""
+        image_features = np.asarray(image_features, dtype=np.float64)
+        text_features = np.asarray(text_features, dtype=np.float64)
+        if image_features.ndim == 2 and image_features.shape[0] == 1:
+            image_features = image_features[0]
+        if (image_features.ndim != 1 or text_features.ndim != 2
+                or image_features.size == 0 or text_features.shape[1] != image_features.size
+                or not np.isfinite(image_features).all() or not np.isfinite(text_features).all()
+                or np.linalg.norm(image_features) == 0
+                or np.any(np.linalg.norm(text_features, axis=1) == 0)):
+            raise RuntimeError("CLIP feature extraction returned invalid features")
+        if text_features.shape[0] == 0:
+            return np.empty(0, dtype=np.float64)
+        if not np.isfinite(self.logit_scale) or self.logit_scale <= 0:
+            raise RuntimeError("CLIP logit_scale must be finite and positive")
+        logits = (text_features @ image_features) * self.logit_scale
+        if not np.isfinite(logits).all():
+            raise RuntimeError("CLIP similarity is not finite")
+        if len(logits) == 1:
+            return np.exp(-np.logaddexp(0.0, -logits))
+        exp_x = np.exp(logits - np.max(logits))
+        return exp_x / (exp_x.sum() + 1e-8)
 
-                output = np.stack(feat_list, axis=0)  # [N, dim]
+    def _prompt_features(self, text):
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("CLIP text prompt must not be empty")
+        _, features = self.extract_text_feature_with_model([text.strip()])
+        features = np.asarray(features)
+        if features.ndim != 2 or features.shape[0] != 1:
+            raise RuntimeError("CLIP text feature extraction failed")
+        return features
 
-            else:
-                logger.error(
-                    f"CLIP 文本模型 batch 维不匹配：模型期望 {expected_bs}，但输入是 {batch_size}。"
-                )
-                return [], np.empty((0, self.feats.shape[1]), dtype=self.feats.dtype)
-
-        except Exception as e:
-            logger.error(f"CLIP 文本模型推理失败: {e}")
-            return [], np.empty((0, self.feats.shape[1]), dtype=self.feats.dtype)
-        output = output / (np.linalg.norm(output, axis=-1, keepdims=True) + 1e-7)
-        return text_list, output
-
-
-    def batch_detect(self, image_data: Image.Image, boxes, single_text: str, threshold: float = 21):
-        """Filter normalized GDINO boxes by raw CLIP score, preserving order.
-
-        Detector passes an RGB PIL image and normalized cxcywh boxes. The
-        returned rectangles are integer pixel xyxy coordinates, as in the
-        reference pipeline. PIL cropping retains its out-of-bounds padding.
-        """
+    def batch_detect(self, image_data: Image.Image, boxes, single_text: str,
+                     threshold: Optional[float] = None):
+        """Filter pixel xyxy rectangles by sigmoid scores from the text model."""
         boxes = np.asarray(boxes, dtype=np.float32).reshape(-1, 4)
         if len(boxes) == 0:
             return [], []
+        if not self.ini_flag:
+            raise RuntimeError("CLIP model is not initialized")
+        threshold = float(self.threshold if threshold is None else threshold)
+        if not np.isfinite(threshold) or not 0 <= threshold <= 1:
+            raise ValueError("CLIP threshold must be between zero and one")
         if not isinstance(image_data, Image.Image):
             raise TypeError("CLIP batch_detect requires a PIL image")
+        text_features = self._prompt_features(single_text)
         image = image_data.convert("RGB")
         rects = box2xyxy(image, boxes)
         selected_rects, confidences = [], []
         for rect in rects:
             crop = image.crop(tuple(rect))
             bgr = np.ascontiguousarray(np.asarray(crop)[:, :, ::-1])
-            score = float(self.similarity(bgr, single_text))
+            image_features = self.extract_image_feature(bgr, reference=True)
+            score = float(self._similarity_scores(image_features, text_features)[0])
             if score > threshold:
                 selected_rects.append(rect)
                 confidences.append(score)
         return selected_rects, confidences
 
-
     def similarity(self, img_bgr: np.ndarray, text: str) -> float:
-        """Return the raw CLIP logit for one crop and arbitrary text prompt.
-
-        The reference food filter compares this scaled cosine similarity with
-        clip_thre (typically 10–30). Softmax over one prompt would always be 1.
-        """
+        """Return sigmoid(logit_scale * cosine) for a directly encoded prompt."""
         if not self.ini_flag:
             raise RuntimeError("CLIP model is not initialized")
-        if not isinstance(text, str) or not text.strip():
-            raise ValueError("CLIP text prompt must not be empty")
+        text_features = self._prompt_features(text)
         image_features = self.extract_image_feature(img_bgr, reference=True)
-        _, text_features = self.extract_text_feature_with_model([text])
-        if image_features is None or text_features is None:
-            raise RuntimeError("CLIP feature extraction failed")
-        image_features = np.asarray(image_features)
-        text_features = np.asarray(text_features)
-        if (image_features.ndim != 2 or text_features.ndim != 2
-                or image_features.shape != text_features.shape or image_features.shape[0] != 1
-                or image_features.shape[1] == 0 or not np.isfinite(image_features).all()
-                or not np.isfinite(text_features).all()
-                or np.linalg.norm(image_features) == 0 or np.linalg.norm(text_features) == 0):
-            raise RuntimeError("CLIP feature extraction returned invalid features")
-        if self.logit_scale is None or not np.isfinite(self.logit_scale) or self.logit_scale <= 0:
-            raise RuntimeError("CLIP logit_scale is missing or invalid")
-        score = float(np.dot(image_features[0], text_features[0]) * self.logit_scale)
-        if not np.isfinite(score):
-            raise RuntimeError("CLIP similarity is not finite")
-        return score
+        return float(self._similarity_scores(image_features, text_features)[0])
 
-
-
-    def detect_with_text_model(self, img: np.ndarray, text_range = None) -> List[Tuple[str, float]]:
+    def detect_with_text_model(self, img: np.ndarray, text_range=None) -> List[Tuple[str, float]]:
         if not self.ini_flag:
             logger.error("CLIP模型未初始化！")
             return []
         try:
-            img_feat = self.extract_image_feature(img)
-            if img_feat.ndim == 2:
-                img_feat = img_feat[0]  # [dim]
-
-            if self.feats_with_text_model and text_range == list(self.feats_with_text_model.keys()):
-                text_List = text_range
-                text_feats = np.stack(
-                    [self.feats_with_text_model[t] for t in text_range],
-                    axis=0
-                )  # [N, dim]
-            else:
-                text_List, text_feats = self.extract_text_feature_with_model(text_range)  # text_feats: [N, dim]
-
-            if text_feats.shape[0] == 0:
-                logger.error("没有可用的文本特征，退出 detect。")
-                return []
-            
-            sims = text_feats @ img_feat
-            if self.logit_scale is not None:
-                logits = sims * float(self.logit_scale)  # [N]
-                #softmax
-                max_logit = np.max(logits)
-                exp_x = np.exp(logits - max_logit)
-                probs = exp_x / (exp_x.sum() + 1e-8)
-                scores = probs  # 用概率作为 score
-            else:
-                scores = sims  # 没有温度系数，就用相似度作为 score
-            N = scores.shape[0]
-            k = min(self.topk, N)
-            top_idx_local = np.argsort(-scores)[:k]
-            results: List[Tuple[str, float]] = []
-            for local_i in top_idx_local:
-                text = text_List[local_i]
-                score = float(scores[local_i])
-                if score >= self.threshold:
-                    results.append((text, score))
-                else:
-                    logger.info(f"相似度低于阈值 {self.threshold}，忽略：{text} | {score}")
-            
-            logger.info(f"CLIP模型识别结果：{results}")
+            texts, text_features = self.extract_text_feature_with_model(text_range)
+            image_features = self.extract_image_feature(img)
+            scores = self._similarity_scores(image_features, text_features)
+            indices = np.argsort(-scores)[:min(self.topk, len(scores))]
+            results = [(texts[index], float(scores[index])) for index in indices
+                       if scores[index] >= self.threshold]
+            logger.info("CLIP模型识别结果：%s", results)
             return results
-        except Exception as e:
-            logger.error(f"CLIP模型输入图片处理失败！{e}")
+        except Exception as exc:
+            logger.error("CLIP模型识别失败：%s", exc)
             return []
 
-
-    def debug_compare_text_features(self, text_list=None):
-        idx_old, feat_old = self.extract_text_feature(text_list)
-        idx_new, feat_new = self.extract_text_feature_with_model(text_list)  # [N, dim]
-
-        if len(idx_old) == 0 or len(idx_new) == 0:
-            logger.error("没有拿到有效的文本特征，无法对比。")
-            return False
-
-        if len(idx_old) != len(idx_new):
-            logger.warning(f"idx_old 和 idx_new 长度不一致！idx_old={len(idx_old)}, idx_new={len(idx_new)}")
-            return False
-
-        if feat_old.shape != feat_new.shape:
-            logger.error(f"特征 shape 不一致：old={feat_old.shape}, new={feat_new.shape}")
-            return False
-
-        cos_sim = np.sum(feat_old * feat_new, axis=1)
-        diff = feat_old - feat_new
-        diff_norm = np.linalg.norm(diff, axis=1)
-
-        logger.info(f"文本特征对比：样本数 N = {feat_old.shape[0]}")
-        logger.info(
-            f"cos-sim 统计：mean={cos_sim.mean():.6f}, "
-            f"min={cos_sim.min():.6f}, max={cos_sim.max():.6f}"
-        )
-        logger.info(
-            f"L2 diff 统计：mean={diff_norm.mean():.6f}, "
-            f"min={diff_norm.min():.6f}, max={diff_norm.max():.6f}"
-        )
-        for i in range(min(5, len(idx_old))):
-            t = self.texts[idx_old[i]]
-            logger.info(f"文本: {t} | cos-sim={cos_sim[i]:.6f}, diff_norm={diff_norm[i]:.6f}")
-
-        if cos_sim.mean() < 0.995 and diff_norm.mean() > 1e-3:
-            logger.error("文本特征和模型提取的特征不一致！")
-            return False
-
-        return True
+    def detect(self, imgbgr: np.ndarray, text_range=None) -> List[Tuple[str, float]]:
+        return self.detect_with_text_model(imgbgr, text_range)
 
 
-
-    def detect(self, imgbgr: np.ndarray, text_range= None) -> List[Tuple[str, float]]:
-        if not self.ini_flag:
-            logger.error("CLIP模型未初始化！")
-            return []
-
-        try:
-            img_feat = self.extract_image_feature(imgbgr)
-            if img_feat.ndim == 2:
-                img_feat = img_feat[0]  # [dim]
-
-            idx_list, text_feats = self.extract_text_feature(text_range)  # text_feats: [N, dim]
-            if text_feats.shape[0] == 0:
-                logger.error("没有可用的文本特征，退出 detect。")
-                return []
-            sims = text_feats @ img_feat
-            if self.logit_scale is not None:
-                logits = sims * float(self.logit_scale)  # [N]
-                #softmax
-                max_logit = np.max(logits)
-                exp_x = np.exp(logits - max_logit)
-                probs = exp_x / (exp_x.sum() + 1e-8)
-                scores = probs
-            else:
-                scores = sims
-            N = scores.shape[0]
-            k = min(self.topk, N)
-            top_idx_local = np.argsort(-scores)[:k]
-            results: List[Tuple[str, float]] = []
-            for local_i in top_idx_local:
-                global_idx = idx_list[local_i]
-                text = self.texts[global_idx]
-                score = float(scores[local_i])
-                if score >= self.threshold:
-                    results.append((text, score))
-            
-            logger.info(f"CLIP模型识别结果：{results}")
-            return results
-        except Exception as e:
-            logger.error(f"CLIP模型输入图片处理失败！{e}")
-            return []
-
-
-if __name__ == '__main__':
-    from app.core.config.store import get_cfg
+if __name__ == "__main__":
+    from app.core.config.loader import load_config
     from app.core.observability.logging import setup_logger
-    
-    setup_logger()
-    config = get_cfg()
-    img = cv2.imread("/data/wangzhuo/01-code/02-project/mainfooddetect/123123.jpg")
 
+    setup_logger()
+    config = load_config()
+    image_path = Path(config["GROUNDINGDINO_CONFIG"].get("test_image_path", "config/images/test.jpg"))
+    if not image_path.is_absolute():
+        image_path = Path(__file__).resolve().parents[3] / image_path
     clip = ClipDetect(config)
-    rangeList = ['速冻包子', '手工包子', '无食材', '带鱼', '大虾', '秋刀鱼', '可乐', '雪碧', '牛奶', '豆浆', '鸡蛋', '火腿肠', '昌鱼', '鳕鱼', '三文鱼', '草鱼', '鲈鱼', '鲫鱼', '黄花鱼', '带鱼段', '龙利鱼', '巴沙鱼', '鳝鱼段', '虾仁', '虾球', '虾滑', '冻虾', '冻虾仁']
-    res = clip.detect_with_text_model(img, text_range= rangeList)
-    print(res)
+    print(clip.detect(cv2.imread(str(image_path)), ["鱼", "虾", "鸡肉"]))

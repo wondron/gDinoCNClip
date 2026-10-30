@@ -125,7 +125,7 @@ GROUNDINGDINO_CONFIG:
 
 ## 启动
 
-依赖仅保留一份根目录 `requirements.txt`，用于 Linux x86_64 GPU 部署，使用 Python 3.10、glibc ≥ 2.27：
+依赖仅保留一份根目录 `requirements.txt`，用于 Linux x86_64 GPU 部署，使用 Python 3.10/3.11、glibc ≥ 2.27：
 
 ```bash
 python -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
@@ -144,6 +144,21 @@ python main.py
 ```
 
 在项目根目录运行上述命令。服务统一通过 `python main.py` 或 `uvicorn main:app --host 0.0.0.0 --port 8678` 启动。HTTP 处理代码位于 `app/adapter/http/endpoints/predict.py`。默认接口文档：`http://127.0.0.1:8678/docs`。不需要安装 PyTorch 或完整 CUDA 编译工具链。
+
+### Docker 部署
+
+Dockerfile 使用 Python 3.11 slim 基础镜像，通过 `requirements.txt` 安装 ONNX Runtime 和匹配的 CUDA 12 / cuDNN 9 运行库，无需安装 Torch、TorchVision 或 Conda。镜像内已设置 NVIDIA 动态库路径，默认执行 `python main.py`，并通过 `/openapi.json` 检查服务是否可用。
+
+在已配置 NVIDIA 驱动与 [NVIDIA Container Toolkit](https://docs.docker.com/compose/how-tos/gpu-support/) 的 Linux x86_64 主机上运行：
+
+```bash
+docker compose up -d --build
+docker compose logs -f fooddetector
+```
+
+服务地址为 `http://127.0.0.1:8678/docs`。模型文件随镜像打包并独立缓存；Compose 将本地 `config/param/` 只读挂载到容器，并将日志和图片保存在本地 `output/`。修改模型文件后重新构建镜像，修改 YAML 后重启服务。
+
+构建时可用 `--build-arg PYTHON_IMAGE=...` 指定 Python 3.11 基础镜像地址，用 `--build-arg PIP_INDEX_URL=...` 指定 Python 包镜像源。
 
 ## 日志
 
@@ -212,18 +227,20 @@ with open("config/images/test.jpg", "rb") as image:
         "http://127.0.0.1:8678/food_detect/",
         files={"image": ("test.jpg", image, "image/jpeg")},
         data={"dino_cap": "glass", "dino_box": 0.35, "dino_text": 0.25,
-              "clip_cap": "玻璃杯", "clip_thre": 21},
+              "clip_cap": "玻璃杯", "clip_thre": 0.5},
         timeout=180,
     )
 response.raise_for_status()
 print(response.json())
 ```
 
-`clip_thre > 0` 时，对每个 DINO 框裁剪图像，计算与 `clip_cap` 的 CLIP 原始相似度 logits，只保留分数严格大于 `clip_thre` 的框。这里的 `21` 是相似度阈值，分数未经过 softmax，不是 0–1 概率。CLIP 随 `Detector` 一起初始化，读取 YAML 的 `CLIP_CONFIG.model_path`、`text_model_path`、`text_path` 和 `use_gpu`；相似度缩放系数 `logit_scale` 从文本特征文件读取。
+`clip_thre > 0` 时，对每个 DINO 框裁剪图像，直接用 CLIP text model 编码 `clip_cap`，计算 `sigmoid(logit_scale × 图文特征点积)`，只保留分数严格大于 `clip_thre` 的框。文本特征在一批检测框中仅推理一次，无需特征库或 JSONL 文件。分数范围为 `0～1`，例如使用阈值 `0.5`；旧的 `21` 这类原始分数阈值会返回 422。CLIP 随 `Detector` 一起初始化，读取 YAML 的 `CLIP_CONFIG.model_path`、`text_model_path`、`logit_scale` 和 `use_gpu`。
+
+`similarity()` 和 `batch_detect()` 使用单文本 sigmoid；`detect()`、`detect_with_text_model()` 传入多个文本时，对 text model 实时提取的特征计算 softmax。文本不需要预先登记。`logit_scale` 保留当前模型的原始缩放值 `95.83539581298828`，较大的正负 logits 会使 sigmoid 分数接近 1 或 0；这些分数未经概率校准，阈值应结合实际样本调整。
 
 `clip_thre <= 0` 时跳过 CLIP，仅保留 DINO 短语包含 `dino_cap` 的框，比较区分大小写，返回的每个置信度固定为 `0.6`。两种模式均返回整数像素坐标 `[x1, y1, x2, y2]`，不增加 NMS，转换时保留参考项目的边界坐标。
 
-成功响应沿用参考项目格式：`{"rects": "[[10, 20, 200, 240]]", "conf": "[27.6]"}`。`rects`、`conf` 都是列表的字符串表示；无检测时为 `{"rects": "[]", "conf": "[]"}`。非图片 MIME 返回 400，缺少字段或数值格式错误返回 422。业务检测沿用当前 `Detector.detect()` 的异常处理，图片解码或模型推理失败时返回空列表；未被业务层捕获的异常由 HTTP 返回 500。原 `/process/` 接口及结果格式保持不变。
+成功响应沿用参考项目格式：`{"rects": "[[10, 20, 200, 240]]", "conf": "[0.87]"}`。`rects`、`conf` 都是列表的字符串表示；无检测时为 `{"rects": "[]", "conf": "[]"}`。非图片 MIME 返回 400，缺少字段或数值格式错误返回 422。业务检测沿用当前 `Detector.detect()` 的异常处理，图片解码或模型推理失败时返回空列表；未被业务层捕获的异常由 HTTP 返回 500。原 `/process/` 接口及结果格式保持不变。
 
 服务启动后另开终端执行：
 

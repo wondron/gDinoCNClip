@@ -1,0 +1,23 @@
+services:
+  fooddetector:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: food-detector:onnx
+    container_name: food_detector
+    platform: linux/amd64
+    init: true
+    volumes:
+      - ./config/param:/app/config/param:ro
+      - ./output:/app/output
+    ports:
+      - "8678:8678"
+    restart: unless-stopped
+    stop_grace_period: 60s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
