@@ -11,7 +11,7 @@ from app.core.config.settings import Settings, local_path
 
 if TYPE_CHECKING:
     from app.core.config.nacos import NacosConfigProvider
-    from app.domain.groundingdino.predictor import OnnxPredictor
+    from app.domain.pipeline.a_gdinoDtct import GdinoDetect
 
 
 @dataclass
@@ -20,7 +20,7 @@ class ApplicationState:
     config: dict
     config_info: dict
     config_provider: NacosConfigProvider
-    predictor: OnnxPredictor | None = None
+    predictor: GdinoDetect | None = None
     stopping: bool = False
     reload_error: str | None = None
 

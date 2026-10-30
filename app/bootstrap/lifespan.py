@@ -4,15 +4,24 @@ from contextlib import asynccontextmanager
 from fastapi.concurrency import run_in_threadpool
 
 from app.bootstrap.state import ApplicationState
-from app.core.config.constant import DEFAULT_BOX_THRESHOLD, DEFAULT_TEXT_THRESHOLD
-from app.core.config.model import ModelSettings
 from app.core.config.nacos import NacosConfigProvider
 from app.core.config.settings import local_path
 from app.core.observability.log_helper import show_text
 from app.core.observability.logging import setup_logger
-from app.domain.groundingdino.predictor import OnnxPredictor
+from app.domain.pipeline.a_gdinoDtct import GdinoDetect
 
 logger = logging.getLogger("main.lifespan")
+
+
+def _same_config_value(left, right):
+    # YAML booleans/floats must not bypass validation by comparing equal to ints.
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(_same_config_value(left[key], right[key]) for key in left)
+    if isinstance(left, (list, tuple)):
+        return len(left) == len(right) and all(_same_config_value(a, b) for a, b in zip(left, right))
+    return left == right
 
 
 def warmup_models(predictor, app_settings):
@@ -21,7 +30,7 @@ def warmup_models(predictor, app_settings):
     cfg = app_settings.warmup
     logger.info("模型预热 | runs=%d | image=%s", cfg.runs, cfg.image_path)
     for _ in range(max(1, cfg.runs)):
-        predictor.predict(local_path(cfg.image_path), cfg.caption, DEFAULT_BOX_THRESHOLD, DEFAULT_TEXT_THRESHOLD)
+        predictor.predict(local_path(cfg.image_path), cfg.caption, predictor.box_threshold, predictor.text_threshold)
 
 
 def apply_nacos_config_update(app, snapshot):
@@ -29,10 +38,16 @@ def apply_nacos_config_update(app, snapshot):
     if runtime.stopping:
         return False
     try:
-        model_settings = ModelSettings.from_config(snapshot.config)
         predictor = runtime.predictor
-        if model_settings != predictor.model_settings:
-            predictor = OnnxPredictor(snapshot.config)
+        model_changed = not _same_config_value(
+            snapshot.config.get("GROUNDINGDINO_CONFIG"), runtime.config.get("GROUNDINGDINO_CONFIG"),
+        )
+        device_changed = not _same_config_value(
+            snapshot.config.get("TOTAL_CONFIG", {}).get("device_id", 0),
+            runtime.config.get("TOTAL_CONFIG", {}).get("device_id", 0),
+        )
+        if model_changed or device_changed:
+            predictor = GdinoDetect(snapshot.config)
             warmup_models(predictor, runtime.settings)
         with runtime.lock:
             if runtime.stopping:
@@ -65,7 +80,7 @@ def create_lifespan(app_settings):
             logger.info("服务启动 | service=%s | config_source=%s | yaml=%s",
                         app_settings.application.service_name, source["source"],
                         local_path(app_settings.config.yaml_path))
-            runtime.predictor = await run_in_threadpool(OnnxPredictor, config)
+            runtime.predictor = await run_in_threadpool(GdinoDetect, config)
             await run_in_threadpool(warmup_models, runtime.predictor, app_settings)
             provider.start_polling(lambda snapshot: apply_nacos_config_update(app, snapshot))
             show_text("服务启动完成", service=app_settings.application.service_name,

@@ -1,6 +1,6 @@
 # GroundingDINO ONNX 服务
 
-沿用 `Image-Embedding/backend` 的配置、日志和模型目录约定，按启动、HTTP、推理算法和 ONNX 运行环境分别组织。运行时不需要 PyTorch、GroundingDINO 源码或 `_C` 扩展。
+沿用 `Image-Embedding/backend` 的配置、日志和模型目录约定，按启动、HTTP、检测流程和算法辅助工具组织。运行时不需要 PyTorch、GroundingDINO 源码或 `_C` 扩展。
 
 ## 目录
 
@@ -14,19 +14,21 @@
         constant.py                    # 部署时修改：端口、日志、Nacos 等
         settings.py                    # 类型化启动配置
         loader.py                      # YAML 读取、模型路径解析
-        model.py                       # 模型参数校验
         nacos.py                       # 配置拉取、本地回退、GET 轮询
       observability/                   # 普通日志、平台 JSON 日志、traceId
     adapter/
       http/                            # 原 /process/ 接口和请求日志
-      onnx/
-        session.py                     # ORT 会话、provider 和原生日志配置
-        cuda.py                        # Windows CUDA DLL 加载
-    domain/groundingdino/
-      predictor.py                     # 统一模型加载、推理和耗时统计
-      preprocess.py                    # 图片、文本预处理和输入构造
-      postprocess.py                   # 阈值筛选和短语解码
-      visualize.py                     # 检测框标注
+    domain/
+      pipeline/
+        a_gdinoDtct.py                  # GdinoDetect：配置读取校验、模型初始化、预热和检测
+        b_clipdtct.py                   # ClipDetect：CLIP 图文匹配
+      common/
+        onnx_utils.py                  # 共用 ORT 会话、provider、日志和 CUDA DLL 加载
+      groundingdino/
+        preprocess.py                  # 图片、文本预处理和输入构造
+        postprocess.py                 # 阈值筛选和短语解码
+        tokenizer.py                   # 本地 BERT 分词器
+        visualize.py                   # 检测框标注
   config/
     param/config.yaml                  # 模型参数；Nacos 使用相同结构
     model/groundingdino/
@@ -55,7 +57,7 @@
 
 模型约 661 MiB，batch=1，图片宽高动态，文本最多 256 token。模型和分词器位于 `config/model/groundingdino/`，配置文件中的相对路径均以本项目目录为根，与运行命令时所在目录无关。运行时直接使用 `tokenizers` 加载本地 `tokenizer.json`，不需要安装 `transformers`。
 
-服务与单图脚本 `scripts/infer.py` 共用 `domain/groundingdino/` 的算法实现与 `adapter/onnx` 的会话配置。HTTP 层负责上传和响应；启动层将配置、模型和上传目录统一保存在 `app.state.runtime`。目录批量脚本 `scripts/infer_folder.py` 的加载、预处理、推理、后处理和结果写入均在同一文件内实现，只依赖标准库及第三方库，不导入本项目其他 Python 文件。
+服务与单图脚本 `scripts/infer.py` 共用 `domain/pipeline/a_gdinoDtct.py` 的 `GdinoDetect`。它按 `b_clipdtct.py` 的形式组织配置读取、模型初始化、预热和检测，`_load_config()` 直接读取并校验配置字典，将模型参数保存到检测器属性；GDINO 的分词与前后处理保留在 `domain/groundingdino/`，通用 ONNX 运行环境集中在 `domain/common/onnx_utils.py`。HTTP 层负责上传和响应；启动层将配置、模型和上传目录统一保存在 `app.state.runtime`。目录批量脚本 `scripts/infer_folder.py` 的加载、预处理、推理、后处理和结果写入均在同一文件内实现，只依赖标准库及第三方库，不导入本项目其他 Python 文件。
 
 部署时保留 `main.py`、`app/`、`config/` 和所选的依赖文件即可，`output/` 会在运行时生成。`scripts/` 用于人工调用，`tests/` 用于回归，`tools/` 用于模型导出与对比，`reports/` 保存验证结果；这些开发辅助目录不参与服务启动。
 
@@ -94,11 +96,19 @@ GROUNDINGDINO_CONFIG:
   short_side: 800
   max_size: 1333
   max_text_len: 256
+  caption: "glass . straw . lemon ."
+  test_image_path: config/images/test.jpg
+  box_threshold: 0.35
+  text_threshold: 0.25
   mean: [0.485, 0.456, 0.406]
   std: [0.229, 0.224, 0.225]
 ```
 
 `use_gpu: false` 使用 CPU。CUDA 模式会检查实际 provider，初始化失败时启动报错。`threads: 0` 使用 ONNX Runtime 默认线程数。更改缩放、归一化或文本长度参数会改变模型输出；默认值保留已验证的原模型处理方式。
+
+`caption`、`box_threshold`、`text_threshold` 是检测默认值，直接在 YAML 中修改。`GdinoDetect.detect()`、CLI 和服务预热使用 YAML 中的阈值；HTTP 表单与 CLI 显式传入的阈值以调用参数为准。配置中的模型、分词器和测试图片路径均支持绝对路径；相对路径以项目目录为根。
+
+运行 `python -m app.domain.pipeline.a_gdinoDtct` 可直接检测 YAML 中的 `test_image_path`，使用配置中的 `caption` 和阈值。
 
 通过环境变量 `GROUNDING_ONNX_CONFIG` 可指定其他 YAML 文件，适用于服务和单图脚本 `scripts/infer.py`。单图脚本读取本地 YAML；服务启用 Nacos 后，优先使用所选环境的远程配置，获取失败才回退本地 YAML。远程多个 dataId 按列表顺序合并，后面的同名参数覆盖前面的参数。独立批量脚本 `scripts/infer_folder.py` 不读取 YAML 或 `constant.py`。
 
@@ -152,6 +162,23 @@ ORT C++ 日志独立于 Python `LOG_LEVEL`。`ORT_LOG_SEVERITY_LEVEL` 同时控�
 
 ## 接口和推理脚本
 
+业务代码可像 `ClipDetect` 一样直接创建检测器，输入 OpenCV 的 BGR 图片和提示词列表：
+
+```python
+import cv2
+
+from app.core.config.loader import load_config
+from app.domain.pipeline.a_gdinoDtct import GdinoDetect
+
+detector = GdinoDetect(load_config())
+detector.warmup(runs=1)
+image = cv2.imread("config/images/test.jpg")
+result = detector.detect(image, ["glass", "straw", "lemon"])
+print(result["boxes"], result["phrases"], result["logits"])
+```
+
+提示词也可直接传入字符串，例如 `"glass . straw . lemon ."`。省略时使用配置中的 `caption`；`detect()` 返回归一化 `cxcywh` 框、短语和分数，与 HTTP 的三个结果字段一致。
+
 接口保持 **`POST /process/`**，`multipart/form-data` 必传 `image`、`discri`、`box_thre`、`text_thre`。两个阈值由调用方传入，不会被配置文件替换。
 
 ```python
@@ -184,7 +211,7 @@ python scripts/test_api.py --output output/client_predictions.json --annotated o
 python scripts/infer.py --image config/images/test.jpg --caption "glass . straw . lemon ." --output output/predictions.json --annotated output/result.jpg
 ```
 
-可以用 `--config` 选择 YAML，用 `--model/--tokenizer/--provider/--device-id/--threads/--short-side/--max-size/--max-text-len` 覆盖本次 CLI 参数。CLI 默认框/文本阈值在 `constant.py` 中定义，也可用 `--box-threshold/--text-threshold` 覆盖。CLI JSON 带运行信息，直接推理不做 HTTP 的 JPEG 重编码。
+可以用 `--config` 选择 YAML，用 `--model/--tokenizer/--provider/--device-id/--threads/--short-side/--max-size/--max-text-len` 覆盖本次 CLI 参数。CLI 默认框/文本阈值读取 YAML 的 `box_threshold` 和 `text_threshold`，也可用 `--box-threshold/--text-threshold` 覆盖。CLI JSON 带运行信息，直接推理不做 HTTP 的 JPEG 重编码。
 
 ### 目录批量推理
 

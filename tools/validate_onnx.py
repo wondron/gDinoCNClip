@@ -114,7 +114,7 @@ def detection_metrics(left, right, min_iou, max_score_diff, max_box_diff):
 def _ort_worker(connection, model, provider, threads):
     """Create ORT in a fresh interpreter without importing torch."""
     try:
-        from app.adapter.onnx.session import create_session
+        from app.domain.common.onnx_utils import create_session
 
         if provider == "cuda" and "torch" in sys.modules:
             raise RuntimeError("CUDA ORT worker must not import PyTorch")
@@ -224,7 +224,7 @@ def run(args, report):
     import onnx
     import onnxruntime as ort
     import torch
-    from app.adapter.onnx.session import create_session
+    from app.domain.common.onnx_utils import create_session
 
     if args.threads > 0:
         torch.set_num_threads(args.threads)

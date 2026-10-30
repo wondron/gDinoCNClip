@@ -12,16 +12,14 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app.domain.groundingdino.predictor import OnnxPredictor
+from app.domain.pipeline.a_gdinoDtct import GdinoDetect
 from app.domain.groundingdino.visualize import annotate
 
 logger = logging.getLogger("onnx.cli")
 
 
 def main():
-    from app.core.config.constant import DEFAULT_BOX_THRESHOLD, DEFAULT_TEXT_THRESHOLD
     from app.core.config.loader import load_config
-    from app.core.config.model import ModelSettings
     from app.core.observability.logging import setup_logger
 
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -31,8 +29,8 @@ def main():
     parser.add_argument("--caption", required=True, help='For example: "person. car."')
     parser.add_argument("--tokenizer", help="Override the configured tokenizer directory")
     parser.add_argument("--provider", choices=("cpu", "cuda"), help="Override use_gpu in YAML")
-    parser.add_argument("--box-threshold", type=float, default=DEFAULT_BOX_THRESHOLD)
-    parser.add_argument("--text-threshold", type=float, default=DEFAULT_TEXT_THRESHOLD)
+    parser.add_argument("--box-threshold", type=float, help="Override box_threshold in YAML")
+    parser.add_argument("--text-threshold", type=float, help="Override text_threshold in YAML")
     parser.add_argument("--short-side", type=int)
     parser.add_argument("--max-size", type=int)
     parser.add_argument("--max-text-len", type=int)
@@ -46,7 +44,8 @@ def main():
     model_config = config["GROUNDINGDINO_CONFIG"]
     for flag, key in (("model", "model_path"), ("tokenizer", "tokenizer_path"),
                       ("threads", "threads"), ("short_side", "short_side"),
-                      ("max_size", "max_size"), ("max_text_len", "max_text_len")):
+                      ("max_size", "max_size"), ("max_text_len", "max_text_len"),
+                      ("box_threshold", "box_threshold"), ("text_threshold", "text_threshold")):
         value = getattr(args, flag)
         if value is not None:
             model_config[key] = value
@@ -54,13 +53,12 @@ def main():
         model_config["use_gpu"] = args.provider == "cuda"
     if args.device_id is not None:
         config.setdefault("TOTAL_CONFIG", {})["device_id"] = args.device_id
-    cfg = ModelSettings.from_config(config)
+    predictor = GdinoDetect(config)
     logger.info("CLI 配置已读取 | model=%s | tokenizer=%s | provider=%s",
-                cfg.model_path, cfg.tokenizer_path, cfg.provider)
-    predictor = OnnxPredictor(config)
+                predictor.model_path, predictor.tokenizer_path, predictor.provider)
     started = perf_counter()
     result, metadata = predictor.predict_with_metadata(
-        args.image, args.caption, args.box_threshold, args.text_threshold,
+        args.image, args.caption, predictor.box_threshold, predictor.text_threshold,
     )
     logger.info("输入信息 | providers=%s | image_size=%s | text_length=%s",
                 predictor.session.get_providers(), metadata['resized_size'], metadata['text_length'])

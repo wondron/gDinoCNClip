@@ -23,14 +23,14 @@ sys.path.insert(0, str(ROOT))
 from app.bootstrap.lifespan import apply_nacos_config_update
 from app.bootstrap.state import ApplicationState
 from app.core.config.loader import load_config, parse_config_text, prepare_config
-from app.core.config.model import ModelSettings
 from app.core.config.nacos import NacosConfigClient, NacosConfigProvider, NacosConfigSnapshot
 from app.core.config.settings import NacosSettings, Settings
 from app.core.observability.json_formatter import CustomJsonFormatter
 from app.core.observability.log_helper import trace_id_var
 from app.core.observability.logging import CustomFormatter, DailyFileHandler, TraceFilter, setup_logger
-from app.adapter.onnx.session import create_session
+from app.domain.common.onnx_utils import create_session
 from app.domain.groundingdino.preprocess import preprocess_image
+from app.domain.pipeline.a_gdinoDtct import GdinoDetect
 from PIL import Image
 
 PROFILE = {
@@ -51,18 +51,24 @@ class ConfigurationChecks(unittest.TestCase):
     def setUp(self):
         self.config = load_config()
 
+    def _detector_config(self, config):
+        with patch.object(GdinoDetect, "init_model"):
+            return GdinoDetect(config)
+
     def test_paths_are_independent_of_working_directory(self):
         original = Path.cwd()
+        raw_config = parse_config_text((ROOT / "config/param/config.yaml").read_text(encoding="utf-8"))
         with tempfile.TemporaryDirectory() as directory:
             try:
                 os.chdir(directory)
-                config = load_config()
+                for config in (load_config(), raw_config):
+                    with self.subTest(raw_yaml=config is raw_config):
+                        cfg = self._detector_config(config)
+                        self.assertTrue(Path(cfg.model_path).is_file())
+                        self.assertTrue(Path(cfg.tokenizer_path).is_dir())
+                        self.assertEqual(cfg.provider, "cuda")
             finally:
                 os.chdir(original)
-        cfg = ModelSettings.from_config(config)
-        self.assertTrue(Path(cfg.model_path).is_file())
-        self.assertTrue(Path(cfg.tokenizer_path).is_dir())
-        self.assertEqual(cfg.provider, "cuda")
 
     def test_invalid_and_missing_model_parameters_fail_early(self):
         for field, value in (("std", [1, 0, 1]), ("mean", [0, 1]), ("use_gpu", "false"),
@@ -71,7 +77,7 @@ class ConfigurationChecks(unittest.TestCase):
                 config = copy.deepcopy(self.config)
                 config["GROUNDINGDINO_CONFIG"][field] = value
                 with self.assertRaises(ValueError):
-                    ModelSettings.from_config(config)
+                    self._detector_config(config)
         with self.assertRaises(ValueError):
             prepare_config({})
         with self.assertRaises(ValueError):
@@ -79,7 +85,7 @@ class ConfigurationChecks(unittest.TestCase):
 
     def test_old_onnx_model_keys_remain_readable(self):
         config = prepare_config({"ONNX_MODEL": {"path": "model.onnx", "tokenizer": "tokenizer", "provider": "cpu"}})
-        cfg = ModelSettings.from_config(config)
+        cfg = self._detector_config(config)
         self.assertEqual(cfg.provider, "cpu")
         self.assertEqual(Path(cfg.model_path), ROOT / "model.onnx")
 
@@ -157,7 +163,7 @@ class ConfigurationChecks(unittest.TestCase):
         self.assertEqual(provider._active.fingerprint, changed.fingerprint)
 
     def _reload_fixture(self):
-        original = SimpleNamespace(model_settings=ModelSettings.from_config(self.config))
+        original = SimpleNamespace()
         app_settings = Settings()
         app_settings = replace(app_settings, warmup=replace(app_settings.warmup, enabled=False))
         provider = Mock()
@@ -165,14 +171,14 @@ class ConfigurationChecks(unittest.TestCase):
         runtime = ApplicationState(app_settings, self.config, {"source": "yaml"}, provider, original)
         app = SimpleNamespace(state=SimpleNamespace(runtime=runtime))
         changed = copy.deepcopy(self.config)
-        changed["GROUNDINGDINO_CONFIG"]["short_side"] = original.model_settings.short_side + 1
+        changed["GROUNDINGDINO_CONFIG"]["short_side"] = self.config["GROUNDINGDINO_CONFIG"].get("short_side", 800) + 1
         snapshot = NacosConfigSnapshot(changed, PROFILE, {"model": "new", "runtime": "new"})
-        replacement = SimpleNamespace(model_settings=ModelSettings.from_config(changed))
+        replacement = SimpleNamespace()
         return app, runtime, original, snapshot, replacement
 
     def test_rejected_model_reload_keeps_previous_predictor(self):
         app, runtime, original, snapshot, _ = self._reload_fixture()
-        with patch("app.bootstrap.lifespan.OnnxPredictor", side_effect=RuntimeError("invalid replacement")):
+        with patch("app.bootstrap.lifespan.GdinoDetect", side_effect=RuntimeError("invalid replacement")):
             self.assertFalse(apply_nacos_config_update(app, snapshot))
         self.assertIs(runtime.predictor, original)
         self.assertIs(runtime.config, self.config)
@@ -182,7 +188,7 @@ class ConfigurationChecks(unittest.TestCase):
     def test_successful_reload_publishes_model_and_configuration_together(self):
         app, runtime, _, snapshot, replacement = self._reload_fixture()
         runtime.reload_error = "previous failure"
-        with patch("app.bootstrap.lifespan.OnnxPredictor", return_value=replacement) as build:
+        with patch("app.bootstrap.lifespan.GdinoDetect", return_value=replacement) as build:
             self.assertTrue(apply_nacos_config_update(app, snapshot))
         build.assert_called_once_with(snapshot.config)
         self.assertIs(runtime.predictor, replacement)
@@ -193,12 +199,41 @@ class ConfigurationChecks(unittest.TestCase):
     def test_invalid_reload_parameters_keep_previous_model_and_configuration(self):
         app, runtime, original, snapshot, _ = self._reload_fixture()
         snapshot.config["GROUNDINGDINO_CONFIG"]["std"] = [1, 0, 1]
-        with patch("app.bootstrap.lifespan.OnnxPredictor") as build:
+        with patch.object(GdinoDetect, "init_model") as build:
             self.assertFalse(apply_nacos_config_update(app, snapshot))
         build.assert_not_called()
         self.assertIs(runtime.predictor, original)
         self.assertIs(runtime.config, self.config)
         self.assertEqual(runtime.config_info, {"source": "yaml"})
+
+    def test_unrelated_configuration_update_keeps_loaded_predictor(self):
+        app, runtime, original, _, _ = self._reload_fixture()
+        changed = copy.deepcopy(self.config)
+        changed["TOTAL_CONFIG"]["machine_list"] = ["demo"]
+        changed["CLIP_CONFIG"] = {"threshold": 0.5}
+        snapshot = NacosConfigSnapshot(changed, PROFILE, {"model": "same", "runtime": "new"})
+        with patch("app.bootstrap.lifespan.GdinoDetect") as build:
+            self.assertTrue(apply_nacos_config_update(app, snapshot))
+        build.assert_not_called()
+        self.assertIs(runtime.predictor, original)
+        self.assertIs(runtime.config, changed)
+        self.assertEqual(runtime.config_info, {"source": "nacos", "revision": "new"})
+
+    def test_type_equal_invalid_reload_values_are_validated(self):
+        for section, field, value in (("GROUNDINGDINO_CONFIG", "use_gpu", 1),
+                                      ("GROUNDINGDINO_CONFIG", "threads", 4.0),
+                                      ("TOTAL_CONFIG", "device_id", False)):
+            with self.subTest(section=section, field=field, value=value):
+                app, runtime, original, _, _ = self._reload_fixture()
+                changed = copy.deepcopy(self.config)
+                changed[section][field] = value
+                snapshot = NacosConfigSnapshot(changed, PROFILE, {"model": "new", "runtime": "new"})
+                with patch.object(GdinoDetect, "init_model") as initialize:
+                    self.assertFalse(apply_nacos_config_update(app, snapshot))
+                initialize.assert_not_called()
+                self.assertIs(runtime.predictor, original)
+                self.assertIs(runtime.config, self.config)
+                self.assertIsNotNone(runtime.reload_error)
 
     def test_stopping_prevents_publication_before_or_during_model_loading(self):
         for already_stopping in (True, False):
@@ -210,7 +245,7 @@ class ConfigurationChecks(unittest.TestCase):
                     runtime.stopping = True
                     return replacement
 
-                with patch("app.bootstrap.lifespan.OnnxPredictor", side_effect=load_while_stopping) as build:
+                with patch("app.bootstrap.lifespan.GdinoDetect", side_effect=load_while_stopping) as build:
                     self.assertFalse(apply_nacos_config_update(app, snapshot))
                 self.assertEqual(build.call_count, 0 if already_stopping else 1)
                 self.assertIs(runtime.predictor, original)

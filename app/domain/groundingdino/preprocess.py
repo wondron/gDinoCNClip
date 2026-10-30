@@ -34,8 +34,12 @@ def _resize_shape(width, height, short_side=800, max_size=1333):
 
 def preprocess_image(image, image_shape=None, short_side=800, max_size=1333,
                      mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)):
-    """Return normalized NCHW float32 array and JSON-compatible image metadata."""
-    if not isinstance(image, Image.Image):
+    """Normalize a path, RGB PIL image or OpenCV uint8 BGR array to NCHW."""
+    if isinstance(image, np.ndarray):
+        if image.ndim != 3 or image.shape[2] != 3 or image.size == 0 or image.dtype != np.uint8:
+            raise ValueError("OpenCV images must be nonempty uint8 BGR arrays with shape [H,W,3]")
+        image = Image.fromarray(np.ascontiguousarray(image[:, :, ::-1]))
+    elif not isinstance(image, Image.Image):
         with Image.open(image) as source:
             image = source.convert("RGB")
     else:
