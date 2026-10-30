@@ -7,6 +7,8 @@ PyYAML==6.0.3
 requests==2.33.1
 numpy==1.26.4
 Pillow>=9.1
+opencv-python-headless>=4.8,<4.12
+six>=1.16
 tokenizers==0.20.3
 onnxruntime-gpu==1.19.2
 

@@ -25,6 +25,7 @@ from PIL import Image
 
 BUNDLE_ROOT = Path(__file__).resolve().parents[1]
 FIELDS = {"image", "discri", "box_thre", "text_thre"}
+FOOD_FIELDS = {"image", "dino_cap", "dino_box", "dino_text", "clip_cap", "clip_thre"}
 RESULT_FIELDS = {"boxes", "phrases", "logits"}
 FORM = {"discri": "glass . straw . lemon .", "box_thre": "0.35", "text_thre": "0.25"}
 
@@ -80,6 +81,7 @@ def run(args, report):
         path = Path(model_settings.get(key, default))
         model_settings[key] = str((path if path.is_absolute() else BUNDLE_ROOT / path).resolve())
     model_settings["use_gpu"] = args.provider == "cuda"
+    settings.setdefault("CLIP_CONFIG", {})["use_gpu"] = args.provider == "cuda"
     image_path = Path(args.image).resolve()
     image_bytes = image_path.read_bytes()
     prior_environment = {name: os.environ.get(name)
@@ -144,14 +146,39 @@ def run(args, report):
                     return {"required_multipart_fields": sorted(FIELDS)}
 
                 _check(report, "openapi_original_fields", schema_test)
+                def food_schema_test():
+                    document = service.app.openapi()
+                    operation = document["paths"]["/food_detect/"]["post"]
+                    schema = _resolve_reference(
+                        document, operation["requestBody"]["content"]["multipart/form-data"]["schema"],
+                    )
+                    assert set(schema["properties"]) == FOOD_FIELDS, schema
+                    assert set(schema["required"]) == FOOD_FIELDS, schema
+                    for name in ("dino_cap", "clip_cap"):
+                        assert schema["properties"][name]["type"] == "string", schema
+                    for name in ("dino_box", "dino_text", "clip_thre"):
+                        assert schema["properties"][name]["type"] == "number", schema
+                    image_schema = schema["properties"]["image"]
+                    assert image_schema["type"] == "string", image_schema
+                    assert (image_schema.get("format") == "binary" or
+                            image_schema.get("contentMediaType") == "application/octet-stream"), image_schema
+                    return {"required_multipart_fields": sorted(FOOD_FIELDS)}
+                _check(report, "openapi_food_detect_fields", food_schema_test)
+
                 def previous_schema_test():
                     previous = BUNDLE_ROOT / "tests/fixtures/openapi.json"
                     assert previous.is_file(), f"OpenAPI fixture missing: {previous}"
                     old = json.loads(previous.read_text(encoding="utf-8"))
                     new = service.app.openapi()
-                    assert old == new, "OpenAPI changed during project restructuring"
-                    return {"entire_openapi_equal": True}
-                _check(report, "openapi_unchanged_after_restructure", previous_schema_test)
+                    assert old["paths"]["/process/"]["post"] == new["paths"]["/process/"]["post"], \
+                        "Original /process/ operation changed"
+                    old_schemas = old.get("components", {}).get("schemas", {})
+                    new_schemas = new.get("components", {}).get("schemas", {})
+                    for name, schema in old_schemas.items():
+                        assert new_schemas.get(name) == schema, f"Original schema changed: {name}"
+                    return {"original_process_operation_equal": True,
+                            "original_component_schemas_equal": sorted(old_schemas)}
+                _check(report, "openapi_original_contract_preserved", previous_schema_test)
                 _check(report, "no_pytorch_import_at_startup", _assert_no_torch)
 
                 def success_and_roundtrip():

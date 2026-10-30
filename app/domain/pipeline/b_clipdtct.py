@@ -1,24 +1,59 @@
 import os, cv2, time, json
 import logging
+from pathlib import Path
 import numpy as np
-import onnxruntime as ort
+from PIL import Image
 from typing import Dict, Optional, Tuple, Any, List
 import app.domain.common.tokenizer as tokenizer
-import app.domain.common.image_utils as z_tools
+from app.domain.common.image_utils import box2xyxy
+from app.domain.pipeline.a_gdinoDtct import create_session
 
 logger = logging.getLogger("clip")
 
 class ClipDetect:
-    def __init__(self, config_data: Dict[str, Any]):
+    def __init__(self, config_data: Dict[str, Any] | str | os.PathLike):
+        if isinstance(config_data, (str, os.PathLike)):
+            from app.core.config.loader import load_config
+
+            config_data = load_config(config_data)
         self._load_config(config_data)
         self.init_model()
 
 
     def _load_config(self, config: Dict[str, Any]):
         clip_cfg = config.get("CLIP_CONFIG", {})
-        self.model_path = clip_cfg.get('model_path', None)
-        self.text_model_path = clip_cfg.get('text_model_path', None)
-        self.text_path = clip_cfg.get('text_path', None)
+        total_cfg = config.get("TOTAL_CONFIG", {})
+        if not isinstance(clip_cfg, dict) or not isinstance(total_cfg, dict):
+            raise ValueError("CLIP_CONFIG and TOTAL_CONFIG must be mappings")
+        project_root = Path(__file__).resolve().parents[3]
+
+        def configured_path(key):
+            value = clip_cfg.get(key)
+            if value is None:
+                return None
+            path = Path(value).expanduser()
+            return str((path if path.is_absolute() else project_root / path).resolve())
+
+        self.model_path = configured_path('model_path')
+        self.text_model_path = configured_path('text_model_path')
+        self.text_path = configured_path('text_path')
+        self.use_gpu = clip_cfg.get('use_gpu', True)
+        if not isinstance(self.use_gpu, bool):
+            raise ValueError("CLIP_CONFIG.use_gpu must be true or false")
+        self.provider = 'cuda' if self.use_gpu else 'cpu'
+        self.device_id = total_cfg.get('device_id', 0)
+        self.threads = clip_cfg.get('threads', 4)
+        for name, value in (('device_id', self.device_id), ('threads', self.threads)):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a nonnegative integer")
+        self.context_length = clip_cfg.get('context_length', 52)
+        self.image_size = clip_cfg.get('image_size', 224)
+        for name, value in (('context_length', self.context_length), ('image_size', self.image_size)):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"CLIP_CONFIG.{name} must be a positive integer")
+        self.verify_text_features = clip_cfg.get('verify_text_features', False)
+        if not isinstance(self.verify_text_features, bool):
+            raise ValueError("CLIP_CONFIG.verify_text_features must be true or false")
         self.threshold = clip_cfg.get('threshold', 0.02)
         self.topk = clip_cfg.get('topk', 5)
 
@@ -41,36 +76,29 @@ class ClipDetect:
 
     def warmup(self, runs: int = 3) -> None:
         t0 = time.time()
-        dummy = np.zeros((self.shape[2], self.shape[3], self.shape[1]), dtype=np.uint8)
+        height = self.shape[2] if isinstance(self.shape[2], int) and self.shape[2] > 0 else self.image_size
+        width = self.shape[3] if isinstance(self.shape[3], int) and self.shape[3] > 0 else self.image_size
+        dummy = np.zeros((height, width, 3), dtype=np.uint8)
         for _ in range(max(1, runs)):
             self.detect(dummy)
         logger.info("预热完成, 次数: %d, 耗时: %.2fs", runs, time.time() - t0)
     
 
     def get_providers(self):
-        available = ort.get_available_providers()
-        providers = []
-        if "CUDAExecutionProvider" in available:
-            providers.append("CUDAExecutionProvider")
-        if "CPUExecutionProvider" in available:
-            providers.append("CPUExecutionProvider")
-        return providers or ["CPUExecutionProvider"]
-        # return ["CPUExecutionProvider"]
+        return ["CUDAExecutionProvider" if self.use_gpu else "CPUExecutionProvider"]
 
 
     def init_model(self):
         self.ini_flag = False
-        textflag = self.load_text_feature()
-        imagflag = self.load_image_model()
-        textmdlflag = self.load_text_model()
-        textRangeflag = self.init_textRange_with_text_model()
-        self.ini_flag = textflag and imagflag and textmdlflag and textRangeflag
-
-        if not self.ini_flag:
+        self.feats_with_text_model = {}
+        if not (self.load_text_feature() and self.load_image_model() and self.load_text_model()):
             logger.error("CLIP模型初始化失败！")
             return
-        check_text_feature = self.debug_compare_text_features()
-        self.ini_flag = check_text_feature
+        self.ini_flag = True
+        # Full feature-bank verification is a diagnostic, not needed for a
+        # request's arbitrary CLIP caption or the cached-feature detect method.
+        if self.verify_text_features:
+            self.ini_flag = self.init_textRange_with_text_model() and self.debug_compare_text_features()
         if self.ini_flag:
             logger.info('CLIP模型初始化完成！')
     
@@ -104,6 +132,8 @@ class ClipDetect:
             self.logit_scale = None
             with open(self.text_path, "r", encoding="utf-8") as f:
                 for line in f:
+                    if not line.strip():
+                        continue
                     entry = json.loads(line.strip())
                     self.texts.append(entry["text"])
                     self.feats.append(entry["feature"])
@@ -111,9 +141,13 @@ class ClipDetect:
                         self.logit_scale = float(entry["logit_scale"])
             
             self.feats = np.asarray(self.feats, dtype=np.float32)
+            if self.feats.ndim != 2 or not self.feats.size or not np.isfinite(self.feats).all():
+                raise ValueError("CLIP text features must be a nonempty finite matrix")
             self.feats = self.feats / (np.linalg.norm(self.feats, axis=-1, keepdims=True) + 1e-7)
             if self.logit_scale is None:
                 self.logit_scale = 1.0
+            if not np.isfinite(self.logit_scale) or self.logit_scale <= 0:
+                raise ValueError("CLIP logit_scale must be finite and positive")
 
             logger.info(f"类别数量：{len(self.texts)}")
             logger.info(f"文本特征维度：{self.feats.shape[1]}")
@@ -129,10 +163,8 @@ class ClipDetect:
             if not os.path.exists(self.text_model_path):
                 logger.error(f"CLIP 文本模型文件：{self.text_model_path} 不存在！")
                 return False
-            providers = self.get_providers()
-            sess_opts = ort.SessionOptions()
-            sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-            self.text_sess = ort.InferenceSession(str(self.text_model_path), sess_opts, providers=providers)
+            self.text_sess = create_session(self.text_model_path, self.provider, self.threads,
+                                            device_id=self.device_id)
             self.text_input_name = self.text_sess.get_inputs()[0].name
             self.text_output_name = self.text_sess.get_outputs()[0].name
             self.text_shape = self.text_sess.get_inputs()[0].shape
@@ -150,10 +182,8 @@ class ClipDetect:
                 logger.error(f"CLIP 模型文件：{self.model_path} 不存在！")
                 return False
 
-            providers = self.get_providers()
-            sess_opts = ort.SessionOptions()
-            sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-            self.sess = ort.InferenceSession(str(self.model_path), sess_opts, providers=providers)
+            self.sess = create_session(self.model_path, self.provider, self.threads,
+                                       device_id=self.device_id)
 
             self.input_name = self.sess.get_inputs()[0].name
             self.output_name = self.sess.get_outputs()[0].name
@@ -168,10 +198,30 @@ class ClipDetect:
             return False
 
 
-    def preprocess_image(self, img_bgr):
+    def preprocess_image(self, img_bgr, *, reference=False):
         try:
-            img = cv2.resize(img_bgr, (self.shape[2], self.shape[3]), interpolation=cv2.INTER_CUBIC)
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            if (not isinstance(img_bgr, np.ndarray) or img_bgr.ndim != 3
+                    or img_bgr.shape[2] != 3 or img_bgr.size == 0 or img_bgr.dtype != np.uint8):
+                raise ValueError("CLIP images must be nonempty uint8 BGR arrays with shape [H,W,3]")
+            height = self.shape[2] if isinstance(self.shape[2], int) and self.shape[2] > 0 else self.image_size
+            width = self.shape[3] if isinstance(self.shape[3], int) and self.shape[3] > 0 else self.image_size
+            if reference:
+                # Match Chinese-CLIP's Resize(shorter side, BICUBIC) followed
+                # by CenterCrop, preserving the proposal's aspect ratio.
+                image = Image.fromarray(np.ascontiguousarray(img_bgr[:, :, ::-1]))
+                source_width, source_height = image.size
+                side = max(width, height)
+                if source_width <= source_height:
+                    resized_width, resized_height = side, int(side * source_height / source_width)
+                else:
+                    resized_width, resized_height = int(side * source_width / source_height), side
+                image = image.resize((resized_width, resized_height), Image.Resampling.BICUBIC)
+                left = int(round((resized_width - width) / 2.0))
+                top = int(round((resized_height - height) / 2.0))
+                img = np.asarray(image.crop((left, top, left + width, top + height)))
+            else:
+                img = cv2.resize(img_bgr, (width, height), interpolation=cv2.INTER_CUBIC)
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             img = img.astype(np.float32) / 255.0
             mean = np.array([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)
             std  = np.array([0.26862954, 0.26130258, 0.27577711], dtype=np.float32)
@@ -184,12 +234,14 @@ class ClipDetect:
             return None
 
 
-    def extract_image_feature(self, img: np.ndarray):
+    def extract_image_feature(self, img: np.ndarray, *, reference=False):
         try:
             if not self.ini_flag:
                 logger.error("初始化未成功, 无法就行图像特征提取！")
                 return None
-            img = self.preprocess_image(img)   
+            img = self.preprocess_image(img, reference=reference)
+            if img is None:
+                return None
             feats = self.sess.run([self.output_name], {self.input_name: img})[0]
             feats = feats / (np.linalg.norm(feats, axis=-1, keepdims=True) + 1e-7)
             return feats
@@ -234,7 +286,9 @@ class ClipDetect:
             logger.error("给定 text_list 中没有任何合法文本，返回空结果。")
             return [], np.empty((0, self.feats.shape[1]), dtype=self.feats.dtype)
 
-        seq_len = self.text_shape[1] if len(self.text_shape) > 1 else 52
+        seq_len = self.text_shape[1] if len(self.text_shape) > 1 else self.context_length
+        if not isinstance(seq_len, int) or seq_len < 1:
+            seq_len = self.context_length
         tokens_list = tokenizer.tokenize(text_list, context_length=seq_len) 
         tokens = np.array(tokens_list, dtype=np.int64)  # [N, seq_len]
         batch_size = tokens.shape[0]
@@ -277,6 +331,61 @@ class ClipDetect:
         return text_list, output
 
 
+    def batch_detect(self, image_data: Image.Image, boxes, single_text: str, threshold: float = 21):
+        """Filter normalized GDINO boxes by raw CLIP score, preserving order.
+
+        Detector passes an RGB PIL image and normalized cxcywh boxes. The
+        returned rectangles are integer pixel xyxy coordinates, as in the
+        reference pipeline. PIL cropping retains its out-of-bounds padding.
+        """
+        boxes = np.asarray(boxes, dtype=np.float32).reshape(-1, 4)
+        if len(boxes) == 0:
+            return [], []
+        if not isinstance(image_data, Image.Image):
+            raise TypeError("CLIP batch_detect requires a PIL image")
+        image = image_data.convert("RGB")
+        rects = box2xyxy(image, boxes)
+        selected_rects, confidences = [], []
+        for rect in rects:
+            crop = image.crop(tuple(rect))
+            bgr = np.ascontiguousarray(np.asarray(crop)[:, :, ::-1])
+            score = float(self.similarity(bgr, single_text))
+            if score > threshold:
+                selected_rects.append(rect)
+                confidences.append(score)
+        return selected_rects, confidences
+
+
+    def similarity(self, img_bgr: np.ndarray, text: str) -> float:
+        """Return the raw CLIP logit for one crop and arbitrary text prompt.
+
+        The reference food filter compares this scaled cosine similarity with
+        clip_thre (typically 10–30). Softmax over one prompt would always be 1.
+        """
+        if not self.ini_flag:
+            raise RuntimeError("CLIP model is not initialized")
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("CLIP text prompt must not be empty")
+        image_features = self.extract_image_feature(img_bgr, reference=True)
+        _, text_features = self.extract_text_feature_with_model([text])
+        if image_features is None or text_features is None:
+            raise RuntimeError("CLIP feature extraction failed")
+        image_features = np.asarray(image_features)
+        text_features = np.asarray(text_features)
+        if (image_features.ndim != 2 or text_features.ndim != 2
+                or image_features.shape != text_features.shape or image_features.shape[0] != 1
+                or image_features.shape[1] == 0 or not np.isfinite(image_features).all()
+                or not np.isfinite(text_features).all()
+                or np.linalg.norm(image_features) == 0 or np.linalg.norm(text_features) == 0):
+            raise RuntimeError("CLIP feature extraction returned invalid features")
+        if self.logit_scale is None or not np.isfinite(self.logit_scale) or self.logit_scale <= 0:
+            raise RuntimeError("CLIP logit_scale is missing or invalid")
+        score = float(np.dot(image_features[0], text_features[0]) * self.logit_scale)
+        if not np.isfinite(score):
+            raise RuntimeError("CLIP similarity is not finite")
+        return score
+
+
 
     def detect_with_text_model(self, img: np.ndarray, text_range = None) -> List[Tuple[str, float]]:
         if not self.ini_flag:
@@ -287,7 +396,7 @@ class ClipDetect:
             if img_feat.ndim == 2:
                 img_feat = img_feat[0]  # [dim]
 
-            if text_range == list(self.feats_with_text_model.keys()):
+            if self.feats_with_text_model and text_range == list(self.feats_with_text_model.keys()):
                 text_List = text_range
                 text_feats = np.stack(
                     [self.feats_with_text_model[t] for t in text_range],

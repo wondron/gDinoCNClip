@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import TypedDict
 
 BASE_DIR = Path(__file__).resolve().parents[3]
-SERVICE_NAME = "grounding-dino"
+SERVICE_NAME = "food_detector"
 VERSION = "1.0.0"
 APP_ENV = "dev"
 DEFAULT_HOST = "0.0.0.0"
@@ -15,7 +15,7 @@ DEFAULT_PORT = 8678
 APP_RELOAD = False
 DEFAULT_YAML_PATH = "config/param/config.yaml"
 
-LOGGER_NAME = "roki_ai_grounding_dino"
+LOGGER_NAME = "roki_ai_food_detector"
 LOG_LEVEL = "INFO"
 ORT_LOG_SEVERITY_LEVEL = 3  # ORT 原生日志：0详细、1信息、2警告、3错误、4致命
 LOG_SAVE_TO_FILE = True

@@ -18,11 +18,11 @@ class TraceFilter(logging.Filter):
 
 class CustomFormatter(logging.Formatter):
     def __init__(self, app_settings=settings):
-        super().__init__("%(asctime)s | %(levelname)-5s | %(name)-20s | %(traceId)s | %(message)s")
+        super().__init__("{asctime} | {levelname:<5} | {name:^15} | {message}", style="{")
         self.tz = timezone(timedelta(hours=app_settings.logging.timezone_offset_hours))
 
     def formatTime(self, record, datefmt=None):
-        return datetime.fromtimestamp(record.created, self.tz).strftime(datefmt or "%m-%d %H:%M:%S")
+        return datetime.fromtimestamp(record.created, self.tz).strftime(datefmt or "%H:%M:%S")
 
     def format(self, record):
         # Formatter fields must not leak into the JSON handler's LogRecord.
@@ -43,8 +43,6 @@ class DailyFileHandler(TimedRotatingFileHandler):
         return int(midnight.timestamp())
 
     def rotation_filename(self, default_name):
-        # The base class formats suffixes in the OS timezone. Compute ours from
-        # the end of this interval instead to agree with log timestamps.
         day = datetime.fromtimestamp(self.rolloverAt - 86400, self.tz).strftime(self.suffix)
         return self.baseFilename + "." + day
 
@@ -53,13 +51,13 @@ def setup_logger(save_to_file=None, save_k8s_file=None, *, app_settings=settings
     cfg = app_settings.logging
     save_to_file = cfg.save_to_file if save_to_file is None else save_to_file
     save_k8s_file = cfg.save_k8s_file if save_k8s_file is None else save_k8s_file
-    level = logging.getLevelName(cfg.level.upper())
-    if not isinstance(level, int):
-        raise ValueError(f"Invalid LOG_LEVEL: {cfg.level}")
     root = logging.getLogger()
-    root.setLevel(level)
+    try:
+        root.setLevel(cfg.level.upper())
+    except ValueError as exc:
+        raise ValueError(f"Invalid LOG_LEVEL: {cfg.level}") from exc
     platform = logging.getLogger("platform")
-    platform.setLevel(level)
+    platform.setLevel(root.level)
     platform.propagate = False
     for target in (root, platform):
         for handler in target.handlers[:]:

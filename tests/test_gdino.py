@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import numpy as np
+import yaml
 from PIL import Image
 
 from app.domain.pipeline.a_gdinoDtct import GdinoDetect
@@ -68,6 +69,11 @@ def fake_session():
 
 
 class GdinoDetectorChecks(unittest.TestCase):
+    def assertDetectionsEqual(self, actual, expected):
+        np.testing.assert_array_equal(actual[0], expected[0])
+        np.testing.assert_array_equal(actual[1], expected[1])
+        self.assertEqual(actual[2], expected[2])
+
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
@@ -115,14 +121,15 @@ class GdinoDetectorChecks(unittest.TestCase):
                 self.assertEqual(set(feeds), set(INPUT_NAMES))
                 self.assertEqual(feeds["attention_mask"].dtype, np.bool_)
                 self.assertEqual(feeds["input_ids"].dtype, np.int64)
-                self.assertEqual(set(result), {"boxes", "phrases", "logits"})
-                self.assertEqual(result["phrases"], ["glass"])
-                np.testing.assert_allclose(result["boxes"], [[0.2, 0.3, 0.1, 0.2]])
-                np.testing.assert_allclose(result["logits"], [0.9])
+                boxes, logits, phrases = result
+                self.assertEqual(phrases, ["glass"])
+                self.assertEqual(boxes.dtype, np.float32)
+                np.testing.assert_allclose(boxes, [[0.2, 0.3, 0.1, 0.2]])
+                np.testing.assert_allclose(logits, [0.9])
                 if reference is None:
                     reference = result
                 else:
-                    self.assertEqual(result, reference)
+                    self.assertDetectionsEqual(result, reference)
         np.testing.assert_array_equal(self.bgr, original)
         self.assertTrue(detector.ini_flag)
 
@@ -130,14 +137,36 @@ class GdinoDetectorChecks(unittest.TestCase):
         detector = GdinoDetect(self.config)
         caption_result = detector.detect(self.bgr, "Glass . Straw .", box_threshold=0.65, text_threshold=0.65)
         list_result = detector.detect(self.bgr, ["glass", "straw"], box_threshold=0.65, text_threshold=0.65)
-        self.assertEqual(caption_result, list_result)
-        self.assertEqual(list_result["phrases"], ["glass", "straw"])
-        np.testing.assert_allclose(list_result["logits"], [0.9, 0.7])
+        self.assertDetectionsEqual(caption_result, list_result)
+        self.assertEqual(list_result[2], ["glass", "straw"])
+        np.testing.assert_allclose(list_result[1], [0.9, 0.7])
         detector.detect(self.bgr, ["straw"])
         self.assertIn(202, self.session.run.call_args.args[1]["input_ids"])
         self.assertNotIn(201, self.session.run.call_args.args[1]["input_ids"])
-        self.assertEqual(detector.detect(self.bgr, box_threshold=1.0),
-                         {"boxes": [], "phrases": [], "logits": []})
+        boxes, logits, phrases = detector.detect(self.bgr, box_threshold=1.0)
+        self.assertEqual(boxes.shape, (0, 4))
+        self.assertEqual(logits.shape, (0,))
+        self.assertEqual(phrases, [])
+        self.assertEqual(boxes[[]].shape, (0, 4))
+
+    def test_yaml_path_initialization_matches_configuration_dictionary(self):
+        path = self.root / "config.yaml"
+        path.write_text(yaml.safe_dump(self.config), encoding="utf-8")
+        from_dict = GdinoDetect(self.config)
+        for source in (path, str(path)):
+            with self.subTest(source=type(source).__name__):
+                from_yaml = GdinoDetect(source)
+                self.assertEqual(from_yaml.model_path, from_dict.model_path)
+                self.assertEqual(from_yaml.box_threshold, 0.8)
+                self.assertDetectionsEqual(from_yaml.detect(self.bgr), from_dict.detect(self.bgr))
+
+    def test_detect_boxes_support_food_service_advanced_indexing(self):
+        detector = GdinoDetect(self.config)
+        image = Image.fromarray(self.bgr[:, :, ::-1])
+        boxes, _, phrases = detector.detect(image, "glass . straw .", 0.65, 0.65)
+        matching_indices = [index for index, phrase in enumerate(phrases) if "straw" in phrase]
+        self.assertEqual(matching_indices, [1])
+        np.testing.assert_allclose(boxes[matching_indices], [[0.6, 0.5, 0.2, 0.3]])
 
     def test_predict_retains_http_threshold_behavior_and_metadata_validation(self):
         detector = GdinoDetect(self.config)

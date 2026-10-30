@@ -19,11 +19,12 @@
     adapter/
       http/                            # 原 /process/ 接口和请求日志
     domain/
+      food_service.py                  # DINO 候选框和 CLIP 相似度筛选
       pipeline/
         a_gdinoDtct.py                  # GdinoDetect：配置读取校验、模型初始化、预热和检测
         b_clipdtct.py                   # ClipDetect：CLIP 图文匹配
       common/
-        onnx_utils.py                  # 共用 ORT 会话、provider、日志和 CUDA DLL 加载
+        image_utils.py                 # 图像处理和检测框坐标转换
       groundingdino/
         preprocess.py                  # 图片、文本预处理和输入构造
         postprocess.py                 # 阈值筛选和短语解码
@@ -57,7 +58,7 @@
 
 模型约 661 MiB，batch=1，图片宽高动态，文本最多 256 token。模型和分词器位于 `config/model/groundingdino/`，配置文件中的相对路径均以本项目目录为根，与运行命令时所在目录无关。运行时直接使用 `tokenizers` 加载本地 `tokenizer.json`，不需要安装 `transformers`。
 
-服务与单图脚本 `scripts/infer.py` 共用 `domain/pipeline/a_gdinoDtct.py` 的 `GdinoDetect`。它按 `b_clipdtct.py` 的形式组织配置读取、模型初始化、预热和检测，`_load_config()` 直接读取并校验配置字典，将模型参数保存到检测器属性；GDINO 的分词与前后处理保留在 `domain/groundingdino/`，通用 ONNX 运行环境集中在 `domain/common/onnx_utils.py`。HTTP 层负责上传和响应；启动层将配置、模型和上传目录统一保存在 `app.state.runtime`。目录批量脚本 `scripts/infer_folder.py` 的加载、预处理、推理、后处理和结果写入均在同一文件内实现，只依赖标准库及第三方库，不导入本项目其他 Python 文件。
+服务与单图脚本 `scripts/infer.py` 共用 `domain/pipeline/a_gdinoDtct.py` 的 `GdinoDetect`。GDINO 和 CLIP 检测器均接受配置字典或 YAML 路径，`_load_config()` 直接读取并校验参数，将模型参数保存到检测器属性；GDINO 的分词与前后处理保留在 `domain/groundingdino/`。ONNX 会话创建、provider 校验和 Windows CUDA 加载位于 `a_gdinoDtct.py`，CLIP 共用其中的 `create_session()`。服务启动时创建一个 `food_service.Detector`，一次加载 GDINO 和 CLIP，`/process/` 共用其中的 `dino` 实例。HTTP 层负责上传和响应；启动层将配置、模型和上传目录统一保存在 `app.state.runtime`。目录批量脚本 `scripts/infer_folder.py` 的加载、预处理、推理、后处理和结果写入均在同一文件内实现，只依赖标准库及第三方库，不导入本项目其他 Python 文件。
 
 部署时保留 `main.py`、`app/`、`config/` 和所选的依赖文件即可，`output/` 会在运行时生成。`scripts/` 用于人工调用，`tests/` 用于回归，`tools/` 用于模型导出与对比，`reports/` 保存验证结果；这些开发辅助目录不参与服务启动。
 
@@ -173,11 +174,11 @@ from app.domain.pipeline.a_gdinoDtct import GdinoDetect
 detector = GdinoDetect(load_config())
 detector.warmup(runs=1)
 image = cv2.imread("config/images/test.jpg")
-result = detector.detect(image, ["glass", "straw", "lemon"])
-print(result["boxes"], result["phrases"], result["logits"])
+boxes, logits, phrases = detector.detect(image, ["glass", "straw", "lemon"])
+print(boxes, phrases, logits)
 ```
 
-提示词也可直接传入字符串，例如 `"glass . straw . lemon ."`。省略时使用配置中的 `caption`；`detect()` 返回归一化 `cxcywh` 框、短语和分数，与 HTTP 的三个结果字段一致。
+提示词也可直接传入字符串，例如 `"glass . straw . lemon ."`。省略时使用配置中的 `caption`；`detect()` 返回 `(boxes, logits, phrases)`，其中 `boxes` 为归一化 `cxcywh` 的 NumPy 数组，支持列表索引筛选；无检测时形状为 `(0, 4)`。`predict()` 和 `predict_with_metadata()` 保留 HTTP 与 CLI 使用的字典结果格式。
 
 接口保持 **`POST /process/`**，`multipart/form-data` 必传 `image`、`discri`、`box_thre`、`text_thre`。两个阈值由调用方传入，不会被配置文件替换。
 
@@ -198,6 +199,31 @@ print(response.json())
 成功 JSON 仅包含 `boxes`、`phrases`、`logits`。框格式为归一化 `[中心x, 中心y, 宽, 高]`。无检测时返回三个空列表。非图片和损坏图片返回 400，缺少表单字段/浮点数格式错误返回 422，推理异常返回 500。
 
 HTTP 保留原来的 JPEG quality=95 重编码后再推理流程。默认短边 800、长边最多 1333、ImageNet 归一化，不增加 NMS。`SAVE_IMAGES_ENABLED = False` 会在推理后清理本次 JPEG，编码流程仍执行。
+
+### 食材检测 `/food_detect/`
+
+`POST /food_detect/` 使用 `multipart/form-data`，必传 `image`、`dino_cap`、`dino_box`、`dino_text`、`clip_cap`、`clip_thre` 六个字段。业务流程位于 `food_service.Detector.detect()`，直接解码原始上传字节：先调用 `dino.detect(image, caption, box_threshold, text_threshold)`，再调用 `clip.batch_detect(image, boxes, caption, threshold)` 筛选候选框。
+
+```python
+import requests
+
+with open("config/images/test.jpg", "rb") as image:
+    response = requests.post(
+        "http://127.0.0.1:8678/food_detect/",
+        files={"image": ("test.jpg", image, "image/jpeg")},
+        data={"dino_cap": "glass", "dino_box": 0.35, "dino_text": 0.25,
+              "clip_cap": "玻璃杯", "clip_thre": 21},
+        timeout=180,
+    )
+response.raise_for_status()
+print(response.json())
+```
+
+`clip_thre > 0` 时，对每个 DINO 框裁剪图像，计算与 `clip_cap` 的 CLIP 原始相似度 logits，只保留分数严格大于 `clip_thre` 的框。这里的 `21` 是相似度阈值，分数未经过 softmax，不是 0–1 概率。CLIP 随 `Detector` 一起初始化，读取 YAML 的 `CLIP_CONFIG.model_path`、`text_model_path`、`text_path` 和 `use_gpu`；相似度缩放系数 `logit_scale` 从文本特征文件读取。
+
+`clip_thre <= 0` 时跳过 CLIP，仅保留 DINO 短语包含 `dino_cap` 的框，比较区分大小写，返回的每个置信度固定为 `0.6`。两种模式均返回整数像素坐标 `[x1, y1, x2, y2]`，不增加 NMS，转换时保留参考项目的边界坐标。
+
+成功响应沿用参考项目格式：`{"rects": "[[10, 20, 200, 240]]", "conf": "[27.6]"}`。`rects`、`conf` 都是列表的字符串表示；无检测时为 `{"rects": "[]", "conf": "[]"}`。非图片 MIME 返回 400，缺少字段或数值格式错误返回 422。业务检测沿用当前 `Detector.detect()` 的异常处理，图片解码或模型推理失败时返回空列表；未被业务层捕获的异常由 HTTP 返回 500。原 `/process/` 接口及结果格式保持不变。
 
 服务启动后另开终端执行：
 

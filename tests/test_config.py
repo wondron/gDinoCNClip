@@ -28,7 +28,7 @@ from app.core.config.settings import NacosSettings, Settings
 from app.core.observability.json_formatter import CustomJsonFormatter
 from app.core.observability.log_helper import trace_id_var
 from app.core.observability.logging import CustomFormatter, DailyFileHandler, TraceFilter, setup_logger
-from app.domain.common.onnx_utils import create_session
+from app.domain.pipeline.a_gdinoDtct import create_session
 from app.domain.groundingdino.preprocess import preprocess_image
 from app.domain.pipeline.a_gdinoDtct import GdinoDetect
 from PIL import Image
@@ -136,13 +136,65 @@ class ConfigurationChecks(unittest.TestCase):
         cfg = NacosSettings(profile="test", enabled=True, profiles=(PROFILE,))
         client = NacosConfigClient(PROFILE, cfg, session)
         provider = NacosConfigProvider(cfg, client_factory=lambda *_: client)
-        with self.assertLogs("main.config.nacos", level="INFO") as logs:
+        with self.assertLogs("nacos", level="INFO") as logs:
             loaded, source = provider.load("config/param/config.yaml")
+            on_update = Mock()
+            provider.start_polling(on_update)
         provider.close()
         self.assertEqual(source["source"], "yaml")
         self.assertEqual(source["nacos_status"], "fallback")
         self.assertEqual(loaded, self.config)
+        self.assertIsNone(provider._thread)
+        on_update.assert_not_called()
         self.assertNotIn("private-token", "\n".join(logs.output))
+
+    def test_nacos_disabled_loads_local_yaml_without_creating_remote_client(self):
+        factory = Mock()
+        cfg = NacosSettings(profile="test", enabled=False, profiles=(PROFILE,))
+        provider = NacosConfigProvider(cfg, client_factory=factory)
+        self.addCleanup(provider.close)
+        loaded, source = provider.load("config/param/config.yaml")
+        on_update = Mock()
+        provider.start_polling(on_update)
+        self.assertEqual(loaded, self.config)
+        self.assertEqual(source["source"], "yaml")
+        self.assertEqual(source["nacos_status"], "disabled")
+        self.assertFalse(source["nacos_polling"])
+        self.assertIsNone(provider._thread)
+        factory.assert_not_called()
+        on_update.assert_not_called()
+
+    def test_invalid_nacos_yaml_falls_back_to_local_file(self):
+        session = Mock()
+        session.post.return_value = response(payload={"accessToken": "test-token"})
+        session.request.return_value = response(text="- not a configuration mapping")
+        cfg = NacosSettings(profile="test", enabled=True, profiles=(PROFILE,))
+        client = NacosConfigClient(PROFILE, cfg, session)
+        provider = NacosConfigProvider(cfg, client_factory=lambda *_: client)
+        self.addCleanup(provider.close)
+        loaded, source = provider.load("config/param/config.yaml")
+        self.assertEqual(loaded, self.config)
+        self.assertEqual(source["source"], "yaml")
+        self.assertEqual(source["nacos_status"], "fallback")
+        self.assertFalse(source["nacos_polling"])
+
+    def test_disabling_polling_preserves_successfully_loaded_nacos_configuration(self):
+        cfg = NacosSettings(profile="test", enabled=True, poll_enabled=False, profiles=(PROFILE,))
+        remote = copy.deepcopy(self.config)
+        remote["GROUNDINGDINO_CONFIG"]["caption"] = "remote caption ."
+        snapshot = NacosConfigSnapshot(remote, PROFILE, {"model": "remote", "runtime": "remote"})
+        client = Mock()
+        client.fetch_snapshot.return_value = snapshot
+        provider = NacosConfigProvider(cfg, client_factory=lambda *_: client)
+        self.addCleanup(provider.close)
+        with patch("app.core.config.nacos.load_config") as load_local:
+            loaded, source = provider.load("config/param/config.yaml")
+            provider.start_polling(Mock())
+        self.assertIs(loaded, remote)
+        self.assertEqual(source["source"], "nacos")
+        self.assertFalse(source["nacos_polling"])
+        self.assertIsNone(provider._thread)
+        load_local.assert_not_called()
 
     def test_nacos_poll_recovers_after_temporary_failure(self):
         cfg = NacosSettings(profile="test", enabled=True, poll_enabled=True, profiles=(PROFILE,),
@@ -168,17 +220,19 @@ class ConfigurationChecks(unittest.TestCase):
         app_settings = replace(app_settings, warmup=replace(app_settings.warmup, enabled=False))
         provider = Mock()
         provider.source_info.return_value = {"source": "nacos", "revision": "new"}
-        runtime = ApplicationState(app_settings, self.config, {"source": "yaml"}, provider, original)
+        original_service = SimpleNamespace(dino=original, clip=SimpleNamespace(ini_flag=True))
+        runtime = ApplicationState(app_settings, self.config, {"source": "yaml"}, provider, original,
+                                   food_service=original_service)
         app = SimpleNamespace(state=SimpleNamespace(runtime=runtime))
         changed = copy.deepcopy(self.config)
         changed["GROUNDINGDINO_CONFIG"]["short_side"] = self.config["GROUNDINGDINO_CONFIG"].get("short_side", 800) + 1
         snapshot = NacosConfigSnapshot(changed, PROFILE, {"model": "new", "runtime": "new"})
-        replacement = SimpleNamespace()
+        replacement = SimpleNamespace(dino=SimpleNamespace(), clip=SimpleNamespace(ini_flag=True))
         return app, runtime, original, snapshot, replacement
 
     def test_rejected_model_reload_keeps_previous_predictor(self):
         app, runtime, original, snapshot, _ = self._reload_fixture()
-        with patch("app.bootstrap.lifespan.GdinoDetect", side_effect=RuntimeError("invalid replacement")):
+        with patch("app.bootstrap.lifespan.Detector", side_effect=RuntimeError("invalid replacement")):
             self.assertFalse(apply_nacos_config_update(app, snapshot))
         self.assertIs(runtime.predictor, original)
         self.assertIs(runtime.config, self.config)
@@ -188,10 +242,11 @@ class ConfigurationChecks(unittest.TestCase):
     def test_successful_reload_publishes_model_and_configuration_together(self):
         app, runtime, _, snapshot, replacement = self._reload_fixture()
         runtime.reload_error = "previous failure"
-        with patch("app.bootstrap.lifespan.GdinoDetect", return_value=replacement) as build:
+        with patch("app.bootstrap.lifespan.Detector", return_value=replacement) as build:
             self.assertTrue(apply_nacos_config_update(app, snapshot))
         build.assert_called_once_with(snapshot.config)
-        self.assertIs(runtime.predictor, replacement)
+        self.assertIs(runtime.predictor, replacement.dino)
+        self.assertIs(runtime.food_service, replacement)
         self.assertIs(runtime.config, snapshot.config)
         self.assertEqual(runtime.config_info, {"source": "nacos", "revision": "new"})
         self.assertIsNone(runtime.reload_error)
@@ -210,9 +265,9 @@ class ConfigurationChecks(unittest.TestCase):
         app, runtime, original, _, _ = self._reload_fixture()
         changed = copy.deepcopy(self.config)
         changed["TOTAL_CONFIG"]["machine_list"] = ["demo"]
-        changed["CLIP_CONFIG"] = {"threshold": 0.5}
+        changed["OTHER_CONFIG"] = {"threshold": 0.5}
         snapshot = NacosConfigSnapshot(changed, PROFILE, {"model": "same", "runtime": "new"})
-        with patch("app.bootstrap.lifespan.GdinoDetect") as build:
+        with patch("app.bootstrap.lifespan.Detector") as build:
             self.assertTrue(apply_nacos_config_update(app, snapshot))
         build.assert_not_called()
         self.assertIs(runtime.predictor, original)
@@ -245,7 +300,7 @@ class ConfigurationChecks(unittest.TestCase):
                     runtime.stopping = True
                     return replacement
 
-                with patch("app.bootstrap.lifespan.GdinoDetect", side_effect=load_while_stopping) as build:
+                with patch("app.bootstrap.lifespan.Detector", side_effect=load_while_stopping) as build:
                     self.assertFalse(apply_nacos_config_update(app, snapshot))
                 self.assertEqual(build.call_count, 0 if already_stopping else 1)
                 self.assertIs(runtime.predictor, original)

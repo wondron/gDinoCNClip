@@ -11,6 +11,7 @@ from app.core.config.settings import Settings, local_path
 
 if TYPE_CHECKING:
     from app.core.config.nacos import NacosConfigProvider
+    from app.domain.food_service import Detector
     from app.domain.pipeline.a_gdinoDtct import GdinoDetect
 
 
@@ -21,6 +22,7 @@ class ApplicationState:
     config_info: dict
     config_provider: NacosConfigProvider
     predictor: GdinoDetect | None = None
+    food_service: Detector | None = None
     stopping: bool = False
     reload_error: str | None = None
 

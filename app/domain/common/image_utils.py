@@ -7,6 +7,19 @@ import logging
 logger = logging.getLogger('imageutils')
 
 
+def box2xyxy(image_data, boxes):
+    w, h = image_data.size
+    boxes = np.asarray(boxes, dtype=np.float32)
+    boxes = boxes * np.array([w, h, w, h], dtype=np.float32)
+    cx, cy, bw, bh = boxes[..., 0], boxes[..., 1], boxes[..., 2], boxes[..., 3]
+    x1 = cx - bw / 2
+    y1 = cy - bh / 2
+    x2 = cx + bw / 2
+    y2 = cy + bh / 2
+    xyxy = np.stack([x1, y1, x2, y2], axis=-1)
+    return xyxy.astype(int).tolist()
+
+
 def normalize_to_u8(x: np.ndarray) -> np.ndarray:
     """
     归一化到 [0,255] 的 uint8 格式
@@ -32,7 +45,6 @@ def overlay_mask(
 ) -> np.ndarray:
     assert img_bgr.ndim == 3 and img_bgr.shape[2] == 3, "img_bgr must be HxWx3"
     H, W = img_bgr.shape[:2]
-
     mask = cv2.resize(vis, (W, H), interpolation=cv2.INTER_NEAREST)
 
     if mask.dtype != np.uint8 or mask.max() <= 1:
@@ -42,21 +54,16 @@ def overlay_mask(
 
     fg = (mask_u8 > 0).astype(np.uint8)
     out = img_bgr.copy()
-
     if mode == "overlay":
-        # ---- 新增：单色模式 ----
         color_arr = np.zeros_like(img_bgr, dtype=np.float32)
         color_arr[:] = color  # 填充指定颜色
-
         a = (fg.astype(np.float32)[..., None]) * float(np.clip(alpha, 0.0, 1.0))
         base = img_bgr.astype(np.float32)
         out = (base * (1.0 - a) + color_arr * a).astype(np.uint8)
-
     elif mode == "stroke":
         contours, _ = cv2.findContours(fg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         w = max(1, int(stroke_width))
         cv2.drawContours(out, contours, -1, color, thickness=w, lineType=cv2.LINE_AA)
-
     return out
 
 
@@ -96,60 +103,6 @@ def trans_image(pre_method, resize_val, origin_image):
         image = padded_image.copy()
         
     return image
-
-
-def resize_mmseg_style(
-    img: np.ndarray,
-    scale: Tuple[int, int],
-    *,
-    keep_ratio: bool = True,
-    interpolation: Literal["linear", "nearest", "area", "bicubic", "lanczos4"] = "linear",
-    allow_upscale: bool = False,
-) -> Tuple[np.ndarray, Tuple[float, float]]:
-    """
-    仿 mmsegmentation 的 Resize:
-      dict(type='Resize', keep_ratio=True, scale=(W, H))
-
-    参数:
-        img: 输入图像 (H, W[, C])
-        scale: (max_w, max_h) 目标缩放上限
-        keep_ratio: 是否保持宽高比 (默认 True)
-        interpolation: 插值方式 (图像通常 linear, mask 用 nearest)
-        allow_upscale: 是否允许放大 (默认 False)
-
-    返回:
-        resized_img: 缩放后的图像
-        (scale_factor_w, scale_factor_h): 实际缩放比例
-    """
-    if img is None or img.size == 0:
-        raise ValueError("输入图像为空")
-
-    max_w, max_h = scale
-    h, w = img.shape[:2]
-
-    interp_map = {
-        "nearest": cv2.INTER_NEAREST,
-        "linear": cv2.INTER_LINEAR,
-        "area": cv2.INTER_AREA,
-        "bicubic": cv2.INTER_CUBIC,
-        "lanczos4": cv2.INTER_LANCZOS4,
-    }
-    interp = interp_map[interpolation]
-
-    if keep_ratio:
-        # 计算保持比例的缩放因子
-        scale_w = max_w / w
-        scale_h = max_h / h
-        factor = min(scale_w, scale_h)
-        if not allow_upscale:
-            factor = min(factor, 1.0)
-        new_w, new_h = int(round(w * factor)), int(round(h * factor))
-    else:
-        # 直接缩放到目标尺寸
-        new_w, new_h = max_w, max_h
-
-    resized = cv2.resize(img, (new_w, new_h), interpolation=interp)
-    return resized, (new_w / w, new_h / h)
 
 
 def resize_image_data(image_data, max_size=700):

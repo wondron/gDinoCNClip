@@ -12,8 +12,7 @@ def run():
 
     from app.core.config.constant import BASE_DIR
     setup_logger()
-    uvicorn.run("main:app", host=settings.application.host, port=settings.application.port,
-                reload=settings.application.reload, log_config=None, app_dir=str(BASE_DIR))
+    uvicorn.run("main:app", host=settings.application.host, port=settings.application.port, reload=settings.application.reload, log_config=None, app_dir=str(BASE_DIR))
 
 
 if __name__ == "__main__":

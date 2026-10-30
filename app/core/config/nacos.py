@@ -1,9 +1,3 @@
-"""Environment-selected Nacos configuration with local YAML fallback and GET polling.
-
-This module intentionally does not use the Nacos HTTP long-poll listener API.
-Configuration changes are detected by periodically fetching the configured
-dataIds through GET /nacos/v1/cs/configs and comparing snapshot fingerprints.
-"""
 from __future__ import annotations
 import hashlib
 import logging
@@ -18,7 +12,7 @@ from app.core.config.constant import NacosProfile
 from app.core.config.loader import load_config, parse_config_text, prepare_config
 from app.core.config.settings import NacosSettings
 
-logger = logging.getLogger("main.config.nacos")
+logger = logging.getLogger("nacos")
 _MARKDOWN_URL = re.compile(r"\[(https?://[^\]]+)\]\([^)]+\)")
 
 class NacosConfigError(RuntimeError):
@@ -299,8 +293,9 @@ class NacosConfigProvider:
 
         config = load_config(yaml_path)
         status = "fallback" if self.settings.enabled else "disabled"
+        reason = "Nacos 不可用" if self.settings.enabled else "Nacos 未启用"
         message = (
-            f"Local YAML configuration loaded | path={yaml_path} | "
+            f"{reason}，已加载本地 YAML 配置 | path={yaml_path} | "
             f"nacos_profile={self.settings.profile} | nacos_status={status}"
         )
         logger.info(message)
@@ -317,25 +312,25 @@ class NacosConfigProvider:
 
     def start_polling(self, on_update: UpdateCallback) -> None:
         """Start periodic normal-GET polling."""
-        if not self.settings.enabled or not self.poll_enabled:
-            logger.info(
-                "Nacos configuration polling disabled | "
-                "enabled=%s | poll_enabled=%s",
-                self.settings.enabled,
-                self.poll_enabled,
-            )
-            show_text(
-                f"Nacos configuration polling disabled | enabled={self.settings.enabled} | "
-                f"poll_enabled={self.poll_enabled}",
-            )
+        if not self.settings.enabled:
+            message = "Nacos 未启用，使用本地 YAML 配置，不启动远程轮询"
+            logger.info(message)
+            show_text(message)
+            return
+
+        if not self.poll_enabled:
+            message = "Nacos 配置轮询未启用，继续使用启动时已加载的配置"
+            logger.info(message)
+            show_text(message)
             return
 
         with self._lock:
             has_active_snapshot = self._active is not None
 
         if not has_active_snapshot:
-            logger.info("Nacos configuration polling skipped | reason=no_available_profile")
-            show_text("Nacos configuration polling skipped | reason=no_available_profile")
+            message = "Nacos 不可用，使用本地 YAML 配置，跳过远程轮询"
+            logger.info(message)
+            show_text(message)
             return
 
         if self._thread is not None and self._thread.is_alive():

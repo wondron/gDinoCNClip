@@ -8,7 +8,7 @@ from app.core.config.nacos import NacosConfigProvider
 from app.core.config.settings import local_path
 from app.core.observability.log_helper import show_text
 from app.core.observability.logging import setup_logger
-from app.domain.pipeline.a_gdinoDtct import GdinoDetect
+from app.domain.food_service import Detector
 
 logger = logging.getLogger("main.lifespan")
 
@@ -33,6 +33,13 @@ def warmup_models(predictor, app_settings):
         predictor.predict(local_path(cfg.image_path), cfg.caption, predictor.box_threshold, predictor.text_threshold)
 
 
+def _build_detector(config):
+    detector = Detector(config)
+    if not detector.clip.ini_flag:
+        raise RuntimeError("CLIP model initialization failed")
+    return detector
+
+
 def apply_nacos_config_update(app, snapshot):
     runtime = app.state.runtime
     if runtime.stopping:
@@ -46,8 +53,13 @@ def apply_nacos_config_update(app, snapshot):
             snapshot.config.get("TOTAL_CONFIG", {}).get("device_id", 0),
             runtime.config.get("TOTAL_CONFIG", {}).get("device_id", 0),
         )
-        if model_changed or device_changed:
-            predictor = GdinoDetect(snapshot.config)
+        clip_changed = not _same_config_value(
+            snapshot.config.get("CLIP_CONFIG"), runtime.config.get("CLIP_CONFIG"),
+        )
+        food_service = runtime.food_service
+        if food_service is None or model_changed or device_changed or clip_changed:
+            food_service = _build_detector(snapshot.config)
+            predictor = food_service.dino
             warmup_models(predictor, runtime.settings)
         with runtime.lock:
             if runtime.stopping:
@@ -55,6 +67,7 @@ def apply_nacos_config_update(app, snapshot):
             runtime.config = snapshot.config
             runtime.config_info = runtime.config_provider.source_info(snapshot)
             runtime.predictor = predictor
+            runtime.food_service = food_service
             runtime.reload_error = None
         logger.info("Nacos 配置更新完成 | profile=%s", snapshot.profile["profile"])
         show_text("Nacos 配置更新完成", profile=snapshot.profile["profile"])
@@ -80,7 +93,8 @@ def create_lifespan(app_settings):
             logger.info("服务启动 | service=%s | config_source=%s | yaml=%s",
                         app_settings.application.service_name, source["source"],
                         local_path(app_settings.config.yaml_path))
-            runtime.predictor = await run_in_threadpool(GdinoDetect, config)
+            runtime.food_service = await run_in_threadpool(_build_detector, config)
+            runtime.predictor = runtime.food_service.dino
             await run_in_threadpool(warmup_models, runtime.predictor, app_settings)
             provider.start_polling(lambda snapshot: apply_nacos_config_update(app, snapshot))
             show_text("服务启动完成", service=app_settings.application.service_name,
@@ -97,6 +111,7 @@ def create_lifespan(app_settings):
             await run_in_threadpool(provider.close)
             if runtime is not None:
                 runtime.predictor = None
+                runtime.food_service = None
             logger.info("服务关闭完成")
             show_text("服务关闭完成")
     return lifespan
