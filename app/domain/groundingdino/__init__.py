@@ -1,0 +1,1 @@
+"""GroundingDINO inference implementation."""

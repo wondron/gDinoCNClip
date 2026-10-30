@@ -1,0 +1,87 @@
+import logging
+from contextlib import asynccontextmanager
+
+from fastapi.concurrency import run_in_threadpool
+
+from app.bootstrap.state import ApplicationState
+from app.core.config.constant import DEFAULT_BOX_THRESHOLD, DEFAULT_TEXT_THRESHOLD
+from app.core.config.model import ModelSettings
+from app.core.config.nacos import NacosConfigProvider
+from app.core.config.settings import local_path
+from app.core.observability.log_helper import show_text
+from app.core.observability.logging import setup_logger
+from app.domain.groundingdino.predictor import OnnxPredictor
+
+logger = logging.getLogger("main.lifespan")
+
+
+def warmup_models(predictor, app_settings):
+    if not app_settings.warmup.enabled:
+        return
+    cfg = app_settings.warmup
+    logger.info("模型预热 | runs=%d | image=%s", cfg.runs, cfg.image_path)
+    for _ in range(max(1, cfg.runs)):
+        predictor.predict(local_path(cfg.image_path), cfg.caption, DEFAULT_BOX_THRESHOLD, DEFAULT_TEXT_THRESHOLD)
+
+
+def apply_nacos_config_update(app, snapshot):
+    runtime = app.state.runtime
+    if runtime.stopping:
+        return False
+    try:
+        model_settings = ModelSettings.from_config(snapshot.config)
+        predictor = runtime.predictor
+        if model_settings != predictor.model_settings:
+            predictor = OnnxPredictor(snapshot.config)
+            warmup_models(predictor, runtime.settings)
+        with runtime.lock:
+            if runtime.stopping:
+                return False
+            runtime.config = snapshot.config
+            runtime.config_info = runtime.config_provider.source_info(snapshot)
+            runtime.predictor = predictor
+            runtime.reload_error = None
+        logger.info("Nacos 配置更新完成 | profile=%s", snapshot.profile["profile"])
+        show_text("Nacos 配置更新完成", profile=snapshot.profile["profile"])
+        return True
+    except Exception as exc:
+        runtime.reload_error = f"{type(exc).__name__}: {exc}"
+        logger.exception("Nacos 配置更新失败，继续使用已加载模型")
+        show_text("Nacos 配置更新失败，继续使用已加载模型", logger_level=logging.ERROR, exc_info=True)
+        return False
+
+
+def create_lifespan(app_settings):
+    @asynccontextmanager
+    async def lifespan(app):
+        setup_logger(app_settings=app_settings)
+        provider = NacosConfigProvider(app_settings.nacos)
+        runtime = None
+        try:
+            config, source = await run_in_threadpool(provider.load, app_settings.config.yaml_path)
+            runtime = ApplicationState(app_settings, config, source, provider)
+            app.state.runtime = runtime
+            runtime.upload_dir.mkdir(parents=True, exist_ok=True)
+            logger.info("服务启动 | service=%s | config_source=%s | yaml=%s",
+                        app_settings.application.service_name, source["source"],
+                        local_path(app_settings.config.yaml_path))
+            runtime.predictor = await run_in_threadpool(OnnxPredictor, config)
+            await run_in_threadpool(warmup_models, runtime.predictor, app_settings)
+            provider.start_polling(lambda snapshot: apply_nacos_config_update(app, snapshot))
+            show_text("服务启动完成", service=app_settings.application.service_name,
+                      configSource=source["source"])
+            yield
+        except Exception:
+            logger.exception("服务启动或运行失败")
+            show_text("服务启动或运行失败", logger_level=logging.ERROR, exc_info=True)
+            raise
+        finally:
+            if runtime is not None:
+                with runtime.lock:
+                    runtime.stopping = True
+            await run_in_threadpool(provider.close)
+            if runtime is not None:
+                runtime.predictor = None
+            logger.info("服务关闭完成")
+            show_text("服务关闭完成")
+    return lifespan
