@@ -14,6 +14,11 @@ def local_path(value: str | Path) -> Path:
     return path if path.is_absolute() else c.BASE_DIR / path
 
 
+def _nacos_profile() -> str:
+    """NACOS_ENV 是测试环境标识：非空选择 test，否则选择 prod。"""
+    return "test" if os.getenv("NACOS_ENV", "").strip() else c.NACOS_DEFAULT_PROFILE
+
+
 @dataclass(frozen=True, slots=True)
 class ApplicationSettings:
     service_name: str = c.SERVICE_NAME
@@ -57,8 +62,8 @@ class WarmupSettings:
 
 @dataclass(frozen=True, slots=True)
 class NacosSettings:
-    profile: str = field(default_factory=lambda: os.getenv("NACOS_ENV", "").strip().lower() or c.NACOS_DEFAULT_PROFILE)
-    enabled: bool = c.NACOS_ENABLED
+    profile: str = field(default_factory=_nacos_profile)
+    enabled: bool = field(default_factory=lambda: c.NACOS_ENABLED)
     poll_enabled: bool = c.NACOS_POLL_ENABLED
     connect_timeout_seconds: float = c.NACOS_CONNECT_TIMEOUT_SECONDS
     request_timeout_seconds: float = c.NACOS_REQUEST_TIMEOUT_SECONDS
@@ -67,8 +72,10 @@ class NacosSettings:
     profiles: tuple[c.NacosProfile, ...] = field(default_factory=lambda: c.NACOS_CONFIG_PROFILES)
 
     def __post_init__(self):
+        if not self.enabled:
+            return
         if self.profile not in {profile["profile"] for profile in self.profiles}:
-            raise ValueError("NACOS_ENV must match a profile in NACOS_CONFIG_PROFILES")
+            raise ValueError("Selected Nacos profile must be configured in NACOS_CONFIG_PROFILES")
         if min(self.connect_timeout_seconds, self.request_timeout_seconds,
                self.poll_interval_seconds, self.retry_interval_seconds) <= 0:
             raise ValueError("Nacos timeout and polling intervals must be positive")

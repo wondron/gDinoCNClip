@@ -134,7 +134,21 @@ CLIP 从 `model_path` 所在目录读取配套的模型、图像预处理和分�
 
 在 `constant.py` 中填写 `NACOS_CONFIG_PROFILES` 的 `prod` / `test`：`server_addresses`、`namespace`、`username`、`password`、`group`、`data_id_list`，再设置 `NACOS_ENABLED = True`。当前连接参数留空，默认关闭，不会请求参考项目的 Nacos 服务。
 
-通过 `NACOS_DEFAULT_PROFILE` 或环境变量 `NACOS_ENV=prod/test` 选择环境。Nacos 中的 YAML 结构与本地 `config/param/config.yaml` 相同，模型路径指向部署机器的文件。
+`constant.py` 的 `NACOS_ENABLED` 是总开关，环境变量不能覆盖它。启用后，根据 `NACOS_ENV` 是否非空选择连接配置：
+
+| `NACOS_ENABLED` | `NACOS_ENV` | 配置来源 |
+| --- | --- | --- |
+| `False` | 任意值或未设置 | 直接读取本地 YAML，不连接 Nacos |
+| `True` | 未设置、空值或全空白 | Nacos `prod`，不可用时回退本地 YAML |
+| `True` | 任意非空值 | Nacos `test`，不可用时回退本地 YAML |
+
+`NACOS_ENV` 只作为测试环境标识，不按 `prod/test` 枚举解析。Compose 默认将它传为空值，因此启用 Nacos 后默认连接 `prod`。测试部署可执行：
+
+```bash
+NACOS_ENV=test docker compose up -d --build
+```
+
+也可将 `docker-compose.yml` 中的 `NACOS_ENV` 直接设为 `"test"`；移除该环境变量或置空即可恢复 `prod`。连接地址、命名空间和账号等参数仍从 `constant.py` 的对应配置读取；修改此文件后，Docker 部署需重新构建镜像。Nacos 中的 YAML 结构与本地 `config/param/config.yaml` 相同，模型路径指向部署机器的文件。
 
 服务使用普通 GET 轮询，默认每 10 秒检查配置变化。参数变化时先加载替换模型；成功后切换，失败时保留当前模型。远程暂时不可用时保留当前配置并重试。模型变更期间可能同时存在两个会话，需要足够内存/显存。启动时远程不可用会使用本地配置，本次进程不启动远程轮询；连接恢复后重启以重新加载远程配置。
 

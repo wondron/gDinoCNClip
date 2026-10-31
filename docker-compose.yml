@@ -7,6 +7,9 @@ services:
     container_name: food_detector
     platform: linux/amd64
     init: true
+    environment:
+      # NACOS_ENABLED=True 时：空值使用 prod，任意非空值使用 test。
+      NACOS_ENV: "${NACOS_ENV:-}"
     volumes:
       - ./config/param:/app/config/param:ro
       - ./output:/app/output

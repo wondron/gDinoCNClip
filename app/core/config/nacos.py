@@ -306,7 +306,9 @@ class NacosConfigProvider:
             "nacos_enabled": self.settings.enabled,
             "nacos_profile": self.settings.profile,
             "nacos_polling": False,
-            "nacos_poll_interval_seconds": self.poll_interval_seconds,
+            "nacos_poll_interval_seconds": (
+                self.poll_interval_seconds if self.settings.enabled else self.settings.poll_interval_seconds
+            ),
             "nacos_status": status,
         }
 

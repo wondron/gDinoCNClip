@@ -1,7 +1,9 @@
-"""GroundingDINO ONNX detector shared by the pipeline, HTTP service and CLI."""
+"""GroundingDINO ONNX detector shared by the pipeline, HTTP service and CLI.
+
+Linux only: runs on CUDA (H20) when available, otherwise falls back to CPU.
+"""
 
 import logging
-import os
 import threading
 from pathlib import Path
 from time import perf_counter
@@ -14,14 +16,6 @@ from app.domain.groundingdino.tokenizer import BertTokenizer
 
 logger = logging.getLogger("groundingdino")
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
-
-
-def _project_path(value):
-    """Resolve a configured path relative to the project root, independent of cwd."""
-    path = Path(value).expanduser()
-    return (path if path.is_absolute() else PROJECT_ROOT / path).resolve()
-
 
 class GdinoDetect:
     def __init__(self, config):
@@ -30,9 +24,8 @@ class GdinoDetect:
             config = load_config(config)
 
         cfg = config["GROUNDINGDINO_CONFIG"]
-        self.model_path = str(_project_path(cfg["model_path"]))
-        self.tokenizer_path = str(_project_path(cfg["tokenizer_path"]))
-        self.provider = "cuda" if cfg.get("use_gpu", True) else "cpu"
+        self.model_path = cfg["model_path"]
+        self.tokenizer_path = cfg["tokenizer_path"]
         self.device_id = config.get("TOTAL_CONFIG", {}).get("device_id", 0)
         self.threads = cfg.get("threads", 4)
         self.short_side = cfg.get("short_side", 800)
@@ -43,17 +36,21 @@ class GdinoDetect:
         self.caption = cfg.get("caption", "object .")
         self.box_threshold = cfg.get("box_threshold", 0.35)
         self.text_threshold = cfg.get("text_threshold", 0.25)
+        self.nms_threshold = cfg.get("nms_threshold", 0.5)  # IoU; None/null disables NMS
+        self.nms_agnostic = cfg.get("nms_agnostic", False)  # True: different phrases also suppress each other
+
         self.lock = threading.Lock()
-        self.ini_flag = False
         self.init_model()
 
     def init_model(self):
         started = perf_counter()
         self.tokenizer = BertTokenizer(self.tokenizer_path)
-        self.session = create_session(self.model_path, self.provider, self.threads, device_id=self.device_id)
+        self.session = create_session(self.model_path, "cuda", self.threads, device_id=self.device_id)
+        self.provider = "cuda" if self.session.get_providers()[0] == "CUDAExecutionProvider" else "cpu"
         self.input_shapes = {item.name: item.shape for item in self.session.get_inputs()}
         self.ini_flag = True
-        logger.info("模型加载完成 path=%s | providers=%s | cost_ms=%.2f", self.model_path, self.session.get_providers(), (perf_counter() - started) * 1000)
+        logger.info("模型加载完成 | path=%s | providers=%s | cost_ms=%.2f",
+                    self.model_path, self.session.get_providers(), (perf_counter() - started) * 1000)
 
     def warmup(self, runs=3):
         """Run dummy images through the same path as detect()."""
@@ -86,13 +83,24 @@ class GdinoDetect:
             self.text_threshold if text_threshold is None else text_threshold,
         )
         boxes = np.asarray(result["boxes"], dtype=np.float32).reshape(-1, 4)
-        return boxes, np.asarray(result["logits"], dtype=np.float32), result["phrases"]
+        logits = np.asarray(result["logits"], dtype=np.float32)
+        phrases = result["phrases"]
+
+        iou = self.nms_threshold
+        if iou is not None and iou < 1 and len(boxes) > 1:
+            keep = nms(boxes, logits, iou, labels=None if self.nms_agnostic else phrases)
+            boxes, logits, phrases = boxes[keep], logits[keep], [phrases[i] for i in keep]
+        return boxes, logits, phrases
 
     def predict(self, image_path, caption, box_threshold, text_threshold):
-        result, _ = self.predict_with_metadata(image_path, caption, box_threshold, text_threshold, validate_thresholds=False)
+        """HTTP entry point (keeps the original non-validating threshold policy, no NMS)."""
+        result, _ = self.predict_with_metadata(image_path, caption, box_threshold, text_threshold,
+                                               validate_thresholds=False)
         return result
 
-    def predict_with_metadata(self, image, caption, box_threshold, text_threshold, *, validate_thresholds=True):
+    def predict_with_metadata(self, image, caption, box_threshold, text_threshold,
+                              *, validate_thresholds=True):
+        """Return (detections, preprocessing metadata) for HTTP/CLI callers (no NMS)."""
         t0 = perf_counter()
         with self.lock:
             t1 = perf_counter()
@@ -109,9 +117,29 @@ class GdinoDetect:
         return result, metadata
 
 
+def nms(boxes, scores, iou_threshold, labels=None):
+    boxes = np.asarray(boxes, dtype=np.float64)
+    lt = boxes[:, :2] - boxes[:, 2:] / 2
+    rb = boxes[:, :2] + boxes[:, 2:] / 2
+    area = np.prod(np.clip(rb - lt, 0, None), axis=1)
+    labels = None if labels is None else np.asarray(labels, dtype=object)
+    order = np.argsort(-np.asarray(scores), kind="stable")
+    keep = []
+    while order.size:
+        i, order = order[0], order[1:]
+        keep.append(i)
+        wh = np.clip(np.minimum(rb[i], rb[order]) - np.maximum(lt[i], lt[order]), 0, None)
+        inter = wh[:, 0] * wh[:, 1]
+        suppress = inter / np.maximum(area[i] + area[order] - inter, 1e-12) > iou_threshold
+        if labels is not None:
+            suppress &= labels[order] == labels[i]
+        order = order[~suppress]
+    return np.sort(np.asarray(keep, dtype=np.int64))
+
+
 def create_session(model, provider="cpu", intra_op_num_threads=0, *, device_id=0,
                    log_severity_level=None):
-    """Create an ORT session; if CUDA is requested it must actually be used."""
+    """Create an ORT session; provider="cuda" falls back to CPU if CUDA is unavailable."""
     import onnxruntime as ort
 
     if log_severity_level is None:
@@ -124,17 +152,14 @@ def create_session(model, provider="cpu", intra_op_num_threads=0, *, device_id=0
     if intra_op_num_threads:
         options.intra_op_num_threads = intra_op_num_threads
 
+    providers = ["CPUExecutionProvider"]
     if provider == "cuda":
-        # Windows + pip-installed nvidia-* wheels: let ORT (>= 1.21) load the CUDA/cuDNN DLLs.
-        if os.name == "nt" and hasattr(ort, "preload_dlls"):
-            ort.preload_dlls()
         # use_tf32=0 keeps FP32 scores stable near the thresholds.
-        providers = [("CUDAExecutionProvider", {"device_id": str(device_id), "use_tf32": "0"})]
-    else:
-        providers = ["CPUExecutionProvider"]
+        providers.insert(0, ("CUDAExecutionProvider", {"device_id": str(device_id), "use_tf32": "0"}))
 
     session = ort.InferenceSession(str(model), sess_options=options, providers=providers)
-    session.disable_fallback()
+    if provider == "cuda" and session.get_providers()[0] != "CUDAExecutionProvider":
+        logger.warning("CUDA 不可用，已回退到 CPU 推理 | active=%s", session.get_providers())
     return session
 
 

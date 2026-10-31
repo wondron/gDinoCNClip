@@ -44,8 +44,8 @@ class NacosProfile(TypedDict):
     data_id_list: list[str]
 
 
-NACOS_ENABLED = False
-NACOS_DEFAULT_PROFILE = "prod"  # 也可设置环境变量 NACOS_ENV=prod/test
+NACOS_ENABLED = False  # 总开关：False 时直接读取本地 YAML
+NACOS_DEFAULT_PROFILE = "prod"  # NACOS_ENV 未设置或为空用 prod，非空用 test
 NACOS_POLL_ENABLED = True
 NACOS_CONNECT_TIMEOUT_SECONDS = 2.0
 NACOS_REQUEST_TIMEOUT_SECONDS = 3.0
