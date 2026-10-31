@@ -36,6 +36,13 @@
       groundingdino_swint_ogc.onnx      # 包含 BERT、视觉网络和检测网络
       groundingdino_swint_ogc.metadata.json
       bert-base-uncased/                # 分词器文件，无需额外 BERT 权重
+    model/clip/
+      model.onnx                       # Chinese CLIP ViT-L/14-336 图文合并模型
+      config.json                      # 模型结构和特征维度
+      preprocessor_config.json         # 图像缩放和归一化参数
+      tokenizer.json                   # 与模型配套的本地 BERT 分词器
+      tokenizer_config.json
+      special_tokens_map.json
     images/test.jpg                    # 测试图片
   output/
     logs/app.log                       # 普通运行日志
@@ -56,7 +63,7 @@
   reports/                             # 检查结果
 ```
 
-模型约 661 MiB，batch=1，图片宽高动态，文本最多 256 token。模型和分词器位于 `config/model/groundingdino/`，配置文件中的相对路径均以本项目目录为根，与运行命令时所在目录无关。运行时直接使用 `tokenizers` 加载本地 `tokenizer.json`，不需要安装 `transformers`。
+GroundingDINO 模型约 661 MiB，batch=1，图片宽高动态，文本最多 256 token。其模型和分词器位于 `config/model/groundingdino/`。CLIP 使用 `config/model/clip/` 中约 1.63 GB 的 Chinese CLIP ViT-L/14-336 合并模型，一个 ONNX 会话输出 768 维图像、文本特征，内存需求高于原 ViT-B/16 模型。配置文件中的相对路径均以本项目目录为根，与运行命令时所在目录无关。两种模型均直接使用 `tokenizers` 加载各自配套的本地 `tokenizer.json`，不需要安装 `transformers` 或 PyTorch。
 
 服务与单图脚本 `scripts/infer.py` 共用 `domain/pipeline/a_gdinoDtct.py` 的 `GdinoDetect`。GDINO 和 CLIP 检测器均接受配置字典或 YAML 路径，`_load_config()` 直接读取并校验参数，将模型参数保存到检测器属性；GDINO 的分词与前后处理保留在 `domain/groundingdino/`。ONNX 会话创建、provider 校验和 Windows CUDA 加载位于 `a_gdinoDtct.py`，CLIP 共用其中的 `create_session()`。服务启动时创建一个 `food_service.Detector`，一次加载 GDINO 和 CLIP，`/process/` 共用其中的 `dino` 实例。HTTP 层负责上传和响应；启动层将配置、模型和上传目录统一保存在 `app.state.runtime`。目录批量脚本 `scripts/infer_folder.py` 的加载、预处理、推理、后处理和结果写入均在同一文件内实现，只依赖标准库及第三方库，不导入本项目其他 Python 文件。
 
@@ -103,11 +110,21 @@ GROUNDINGDINO_CONFIG:
   text_threshold: 0.25
   mean: [0.485, 0.456, 0.406]
   std: [0.229, 0.224, 0.225]
+
+CLIP_CONFIG:
+  model_path: config/model/clip/model.onnx
+  use_gpu: true
+  threads: 4
+  context_length: 512
+  batch_size: 1
+  threshold: 0.5
 ```
 
 `use_gpu: false` 使用 CPU。CUDA 模式会检查实际 provider，初始化失败时启动报错。`threads: 0` 使用 ONNX Runtime 默认线程数。更改缩放、归一化或文本长度参数会改变模型输出；默认值保留已验证的原模型处理方式。
 
 `caption`、`box_threshold`、`text_threshold` 是检测默认值，直接在 YAML 中修改。`GdinoDetect.detect()`、CLI 和服务预热使用 YAML 中的阈值；HTTP 表单与 CLI 显式传入的阈值以调用参数为准。配置中的模型、分词器和测试图片路径均支持绝对路径；相对路径以项目目录为根。
+
+CLIP 从 `model_path` 所在目录读取配套的模型、图像预处理和分词器 JSON。当前模型使用 RGB 图像，bicubic 直接缩放至 `336×336`，不做居中裁剪，再按配套配置归一化；文本添加 `[CLS]`、`[SEP]`，按 `context_length` 截断和补齐，最大 512 token。`batch_size` 控制一次推理的候选图像数量，默认 1 以限制内存使用，可按显存容量调大。`threshold` 是未显式传入阈值时的默认分数阈值，HTTP 仍使用表单中的 `clip_thre`。
 
 运行 `python -m app.domain.pipeline.a_gdinoDtct` 可直接检测 YAML 中的 `test_image_path`，使用配置中的 `caption` 和阈值。
 
@@ -234,9 +251,9 @@ response.raise_for_status()
 print(response.json())
 ```
 
-`clip_thre > 0` 时，对每个 DINO 框裁剪图像，直接用 CLIP text model 编码 `clip_cap`。图文特征归一化后计算余弦相似度，使用 `clip((cosine + 1) / 2, 0, 1)` 作为分数，只保留分数严格大于 `clip_thre` 的框。文本特征在一批检测框中仅推理一次，无需特征库或 JSONL 文件。分数范围为 `0～1`；旧的 `21` 这类原始分数阈值会返回 422。CLIP 随 `Detector` 一起初始化，读取 YAML 的 `CLIP_CONFIG.model_path`、`text_model_path` 和 `use_gpu`。
+`clip_thre > 0` 时，裁剪 DINO 候选框并按 `batch_size` 分批，与 `clip_cap` 一起输入 CLIP 合并模型。文本每次请求分词一次；每批候选图像推理时，模型同时计算图像、文本特征，无需特征库或 JSONL 文件。图文特征归一化后计算余弦相似度，使用 `clip((cosine + 1) / 2, 0, 1)` 作为分数，只保留分数严格大于 `clip_thre` 的框。分数范围为 `0～1`；旧的 `21` 这类原始分数阈值会返回 422。CLIP 随 `Detector` 一起初始化，通过 YAML 的 `CLIP_CONFIG.model_path` 加载单个 ONNX 模型及同目录的配套 JSON。
 
-`similarity()`、`batch_detect()`、`detect()` 和 `detect_with_text_model()` 使用相同的余弦线性映射，不再使用 `logit_scale`、sigmoid 或 softmax。多文本的分数分别计算，增加候选文本不会改变已有文本的分数，排序与余弦相似度一致。例如余弦值 `0.6` 映射为 `0.8`；阈值 `0.5` 对应原始余弦值 `0`。这些分数表示相似度，未经概率校准，阈值应结合实际样本调整。
+`similarity()` 和 `batch_detect()` 使用相同的余弦线性映射，不使用 `logit_scale`、sigmoid 或 softmax。例如余弦值 `0.6` 映射为 `0.8`；阈值 `0.5` 对应原始余弦值 `0`。这些分数表示相似度，未经概率校准；更换模型后应结合实际样本重新检查阈值。
 
 `clip_thre <= 0` 时跳过 CLIP，仅保留 DINO 短语包含 `dino_cap` 的框，比较区分大小写，返回的每个置信度固定为 `0.6`。两种模式均返回整数像素坐标 `[x1, y1, x2, y2]`，不增加 NMS，转换时保留参考项目的边界坐标。
 

@@ -1,0 +1,18 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: 调试 CLIP（b_clipdtct）",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "app.domain.pipeline.b_clipdtct",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}",
+                "PYTHONIOENCODING": "utf-8"
+            }
+        }
+    ]
+}
