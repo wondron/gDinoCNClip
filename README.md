@@ -224,9 +224,9 @@ docker compose logs -f fooddetector
 
 ## 日志
 
-启动、配置来源、模型路径和 provider、请求参数、检测数量、排队/预处理/推理/后处理耗时、400/422/500 状态和异常堆栈均有日志。普通日志写入 `output/logs/app.log`，结构化日志写入 `output/logs/platform.log`，按配置时区每天轮转。
+启动、配置来源、Nacos 读取与修改、模型路径和 provider、请求参数、检测数量、排队/预处理/推理/后处理耗时、接口错误和异常堆栈均有日志；Nacos 相关信息同时写入普通日志和平台日志。不输出 HTTP 请求摘要（方法、路径、状态码、耗时），FastAPI 参数校验返回的 422 也不单独记日志。普通日志写入 `output/logs/app.log`，结构化日志写入 `output/logs/platform.log`，按配置时区每天轮转。
 
-每个 HTTP 请求生成 `traceId`，贯穿线程池推理日志，同时通过响应头 `X-Trace-Id` 返回；响应 JSON 仍保留原接口的三个字段。平台日志包含 `index/time/env/logger/level/thread/class/message/traceId/stack_trace` 和状态、耗时等业务字段。可以使用与参考项目相同的调用方式：
+每个 HTTP 请求生成 `traceId`，贯穿线程池推理日志，同时通过响应头 `X-Trace-Id` 返回；响应 JSON 仍保留原接口的三个字段。平台日志包含 `index/time/env/logger/level/thread/class/message/traceId/stack_trace` 和调用时传入的业务字段。可以使用与参考项目相同的调用方式：
 
 ```python
 from app.core.observability.log_helper import show_text

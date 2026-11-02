@@ -424,10 +424,11 @@ class NacosConfigProvider:
         if active is not None and fingerprint == active.fingerprint:
             # 内容回到当前生效版本后，之前被拒绝的内容再次发布时允许重新尝试。
             self._rejected_fingerprint = None
-            logger.debug("Nacos configuration unchanged | profile=%s", name)
+            _log(logging.DEBUG, f"Nacos configuration unchanged | profile={name}", profile=name)
             return
         if fingerprint == self._rejected_fingerprint:
-            logger.debug("Nacos configuration still matches the rejected content | profile=%s", name)
+            _log(logging.DEBUG, f"Nacos configuration still matches the rejected content | profile={name}",
+                 profile=name)
             return
 
         changed_data_ids = _changed_data_ids(active.raw_configs if active is not None else {}, raw_configs)

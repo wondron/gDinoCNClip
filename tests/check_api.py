@@ -317,13 +317,16 @@ def run(args, report):
                     from app.core.config.settings import local_path
                     log_dir = local_path(app_settings.paths.output_dir) / "logs"
                     records = [json.loads(line) for line in (log_dir / "platform.log").read_text(encoding="utf-8").splitlines()]
-                    request_records = [record for record in records if record["message"] == "HTTP 请求完成"]
-                    assert {200, 400, 422, 500} <= {record["status"] for record in request_records}
-                    assert all(record.get("traceId") for record in request_records)
-                    assert any(record["stack_trace"] and "intentional contract test error" in record["stack_trace"] for record in records)
-                    assert any(record["message"] == "推理完成" and "inference_ms" in record and record["traceId"] for record in records)
-                    assert (log_dir / "app.log").is_file()
-                    return {"json_records": len(records), "http_statuses": [200, 400, 422, 500], "trace_id_and_timings": True}
+                    app_log = (log_dir / "app.log").read_text(encoding="utf-8")
+                    # 不输出 HTTP 请求摘要：普通日志和平台日志中都没有 "HTTP 请求完成"。
+                    assert not any(record["message"] == "HTTP 请求完成" for record in records), \
+                        "HTTP request summaries must not reach platform.log"
+                    assert "HTTP 请求完成" not in app_log, "HTTP request summaries must not reach app.log"
+                    assert any(record["stack_trace"] and "intentional contract test error" in record["stack_trace"]
+                               and record.get("traceId") for record in records), "inference failure without trace"
+                    assert any(record["message"] == "推理完成" and "inference_ms" in record and record["traceId"]
+                               for record in records), "no platform 推理完成 record with inference_ms"
+                    return {"json_records": len(records), "http_request_summaries": 0, "trace_id_and_timings": True}
                 _check(report, "application_and_platform_logs", log_test)
     finally:
         for name, value in prior_environment.items():

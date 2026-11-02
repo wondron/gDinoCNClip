@@ -1,5 +1,6 @@
 """Offline configuration, logging and Nacos checks; no GPU or remote service required."""
 
+import asyncio
 import copy
 import itertools
 import json
@@ -21,13 +22,14 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from app.adapter.http.middleware import RequestLoggingMiddleware
 from app.bootstrap.lifespan import apply_nacos_config_update
 from app.bootstrap.state import ApplicationState
 from app.core.config.loader import load_config, parse_config_text, prepare_config
 from app.core.config.nacos import NacosConfigClient, NacosConfigError, NacosConfigProvider, NacosConfigSnapshot
 from app.core.config.settings import NacosSettings, Settings
 from app.core.observability.json_formatter import CustomJsonFormatter
-from app.core.observability.log_helper import trace_id_var
+from app.core.observability.log_helper import show_text, trace_id_var
 from app.core.observability.logging import CustomFormatter, DailyFileHandler, TraceFilter, setup_logger
 from app.domain.pipeline.a_gdinoDtct import create_session
 from app.domain.groundingdino.preprocess import preprocess_image
@@ -323,6 +325,21 @@ class ConfigurationChecks(unittest.TestCase):
         self.assertIs(provider._active, snapshot)
         self.assertEqual(provider.source_info(snapshot)["source"], "nacos")
 
+    def test_every_nacos_poll_event_reaches_both_the_service_and_platform_logs(self):
+        provider = self._scripted_provider([self._raw("one"), NacosConfigError("offline"), self._raw("two")],
+                                           startup=self._raw("one"))
+        with patch("app.core.config.nacos.show_text") as platform, self.assertLogs("nacos", level="DEBUG") as logs:
+            provider._poll_loop(Mock(return_value=True))
+        # 读取（含未变化）、失败、恢复、修改检测与应用：logger 和 show_text 收到相同消息和级别。
+        self.assertEqual([call.args[0] for call in platform.call_args_list],
+                         [record.getMessage() for record in logs.records])
+        self.assertEqual([call.kwargs["logger_level"] for call in platform.call_args_list],
+                         [record.levelno for record in logs.records])
+        events = " / ".join(record.getMessage().split(" |")[0] for record in logs.records)
+        self.assertEqual(events, "Nacos configuration unchanged / Nacos configuration poll failed; retaining current "
+                                 "config / Nacos configuration poll recovered / Nacos configuration change detected "
+                                 "by polling / Nacos configuration update applied")
+
     def test_nacos_text_is_decoded_as_utf8_without_a_charset_header(self):
         text = "CLIP_CONFIG:\n  detect_range: [皮皮虾, 鱿鱼]\n"
         reply = requests.Response()
@@ -447,6 +464,35 @@ class ConfigurationChecks(unittest.TestCase):
         self.assertEqual(result["message"], "中文日志")
         self.assertNotIn("asctime", record.__dict__)
         self.assertNotIn("message", record.__dict__)
+
+    def test_http_middleware_logs_no_request_summary_but_keeps_trace_and_errors(self):
+        async def endpoint(scope, receive, send):
+            show_text("业务平台日志")
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b"{}"})
+
+        async def failing(scope, receive, send):
+            raise RuntimeError("intentional middleware error")
+
+        sent = []
+
+        async def send(message):
+            sent.append(message)
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        scope = {"type": "http", "method": "GET", "path": "/openapi.json"}
+        with self.assertLogs("platform", level="DEBUG") as platform, self.assertNoLogs("http", level="DEBUG"):
+            asyncio.run(RequestLoggingMiddleware(endpoint)(scope, receive, send))
+        trace_id = dict(sent[0]["headers"])[b"x-trace-id"].decode()
+        # 不输出请求摘要；请求内的业务平台日志仍带本次请求的 traceId（与响应头一致）。
+        self.assertEqual([record.getMessage() for record in platform.records], ["业务平台日志"])
+        self.assertEqual(platform.records[0].traceId, trace_id)
+
+        with self.assertLogs("http", level="ERROR") as http, self.assertRaises(RuntimeError):
+            asyncio.run(RequestLoggingMiddleware(failing)(scope, receive, send))
+        self.assertIn("HTTP 请求异常 | method=GET | path=/openapi.json", http.records[0].getMessage())
 
     def test_logger_initialization_is_idempotent_and_rotation_uses_config_timezone(self):
         app_settings = Settings()
