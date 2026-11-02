@@ -344,6 +344,21 @@ class NacosConfigProvider:
         logger.info("Nacos configuration polling started | interval=%.3fs", self.poll_interval_seconds,)
         show_text(f"Nacos configuration polling started | interval={self.poll_interval_seconds:.3f}s")
 
+    @staticmethod
+    def _changed_data_ids(
+        previous: NacosConfigSnapshot,
+        candidate: NacosConfigSnapshot,
+    ) -> list[str]:
+        """Return dataIds whose raw Nacos payload changed between snapshots."""
+        data_ids = list(dict.fromkeys(
+            [*previous.profile["data_id_list"], *candidate.profile["data_id_list"]]
+        ))
+        return [
+            data_id
+            for data_id in data_ids
+            if previous.raw_configs.get(data_id) != candidate.raw_configs.get(data_id)
+        ]
+
     def _poll_loop(self, on_update: UpdateCallback) -> None:
         try:
             while not self._stop_event.is_set():
@@ -388,35 +403,69 @@ class NacosConfigProvider:
                     )
                     continue
 
+                changed_data_ids = self._changed_data_ids(active, candidate)
                 logger.info(
                     "Nacos configuration change detected by polling | "
-                    "old_profile=%s | new_profile=%s",
+                    "old_profile=%s | new_profile=%s | changed_data_ids=%s",
                     active.profile["profile"],
                     candidate.profile["profile"],
+                    changed_data_ids,
                 )
                 show_text(
                     "Nacos configuration change detected by polling | "
-                    f"old_profile={active.profile['profile']} | new_profile={candidate.profile['profile']}",
+                    f"old_profile={active.profile['profile']} | "
+                    f"new_profile={candidate.profile['profile']} | "
+                    f"changed_data_ids={changed_data_ids}",
                 )
 
-                if on_update(candidate):
+                try:
+                    applied = bool(on_update(candidate))
+                except Exception as exc:
+                    logger.exception(
+                        "Nacos configuration update callback failed | "
+                        "profile=%s | changed_data_ids=%s | error=%s: %s; "
+                        "retaining last working snapshot",
+                        candidate.profile["profile"],
+                        changed_data_ids,
+                        type(exc).__name__,
+                        exc,
+                    )
+                    show_text(
+                        "Nacos configuration update callback failed | "
+                        f"profile={candidate.profile['profile']} | "
+                        f"changed_data_ids={changed_data_ids} | "
+                        f"error={type(exc).__name__}: {exc}; "
+                        "retaining last working snapshot",
+                        logger_level=logging.ERROR,
+                        exc_info=True,
+                    )
+                    continue
+
+                if applied:
                     with self._lock:
                         self._active = candidate
 
                     logger.info(
-                        "Nacos configuration update applied | profile=%s",
+                        "Nacos configuration update applied | profile=%s | changed_data_ids=%s",
                         candidate.profile["profile"],
+                        changed_data_ids,
                     )
-                    show_text(f"Nacos configuration update applied | profile={candidate.profile['profile']}")
+                    show_text(
+                        "Nacos configuration update applied | "
+                        f"profile={candidate.profile['profile']} | "
+                        f"changed_data_ids={changed_data_ids}"
+                    )
                 else:
                     logger.warning(
                         "Nacos configuration update rejected; "
-                        "keeping last working snapshot | profile=%s",
+                        "keeping last working snapshot | profile=%s | changed_data_ids=%s",
                         candidate.profile["profile"],
+                        changed_data_ids,
                     )
                     show_text(
                         "Nacos configuration update rejected; "
-                        f"keeping last working snapshot | profile={candidate.profile['profile']}",
+                        f"keeping last working snapshot | profile={candidate.profile['profile']} | "
+                        f"changed_data_ids={changed_data_ids}",
                         logger_level=logging.WARNING,
                     )
         finally:
