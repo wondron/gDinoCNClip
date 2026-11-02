@@ -1,26 +1,19 @@
 services:
   fooddetector:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: food-detector:onnx
+    image: aliyun-docker-harbor-registry.cn-hangzhou.cr.aliyuncs.com/roki-ai/roki-ai-food-detector-model:20250609
     container_name: food_detector
-    platform: linux/amd64
-    init: true
     environment:
       # NACOS_ENABLED=True 时：空值使用 prod，任意非空值使用 test。
       NACOS_ENV: "${NACOS_ENV:-}"
-    volumes:
-      - ./config/param:/app/config/param:ro
-      - ./output:/app/output
     ports:
-      - "8678:8678"
-    restart: unless-stopped
-    stop_grace_period: 60s
+      - "8695:8695"
+    command: python3.11 -m uvicorn main:app --host 0.0.0.0 --port 8695
+    stdin_open: true         # 等效于 -i
+    tty: true                # 等效于 -t
+    restart: unless-stopped  # 容器在异常退出时自动重启，适合后台运行
     deploy:
       resources:
         reservations:
           devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
+            - capabilities: [gpu]
+    runtime: nvidia          # 仅旧版 docker 需要，新版用 --gpus 会自动处理

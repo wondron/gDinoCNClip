@@ -1,7 +1,8 @@
 ARG PYTHON_IMAGE=python:3.11-slim-bookworm
 FROM ${PYTHON_IMAGE}
 
-ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+# Override with --build-arg PIP_INDEX_URL=<mirror> when building behind a slow network.
+ARG PIP_INDEX_URL=https://pypi.org/simple
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -44,9 +45,10 @@ COPY main.py ./
 
 RUN mkdir -p /app/output
 
-EXPOSE 8678
+EXPOSE 8695
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=180s --retries=3 \
-    CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8678/openapi.json', timeout=3).close()"]
+    CMD ["python3.11", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8695/openapi.json', timeout=3).close()"]
 
-CMD ["python", "main.py"]
+# Same as the docker-compose command; uvicorn CLI skips main.py's reload=True and sets the port.
+CMD ["python3.11", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8695"]
