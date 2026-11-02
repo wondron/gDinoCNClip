@@ -159,7 +159,13 @@ NACOS_ENV=test docker compose up -d --build
 
 也可将 `docker-compose.yml` 中的 `NACOS_ENV` 条目直接改为 `- NACOS_ENV=test`；移除该环境变量或置空即可恢复 `prod`。连接地址、命名空间和账号等参数仍从 `constant.py` 的对应配置读取；修改此文件后，Docker 部署需重新构建镜像。Nacos 中的 YAML 结构与本地 `config/param/config.yaml` 相同，模型路径指向部署机器的文件。
 
-服务使用普通 GET 轮询，默认每 10 秒检查配置变化。参数变化时先加载替换模型；成功后切换，失败时保留当前模型。远程暂时不可用时保留当前配置并重试。模型变更期间可能同时存在两个会话，需要足够内存/显存。启动时远程不可用会使用本地配置，本次进程不启动远程轮询；连接恢复后重启以重新加载远程配置。
+服务使用普通 GET 轮询，默认每 10 秒检查配置变化；内容未变时只比较原文指纹，不重复解析。配置变化后：
+
+- 先校验 GroundingDINO 参数（类型和取值范围，如 `threads` 必须是整数、`std` 必须为正），不合法时直接拒绝，不加载任何模型。
+- 只重新加载配置有变化的模型：`GROUNDINGDINO_CONFIG` 或 `TOTAL_CONFIG.device_id` 变化时重建 GroundingDINO，`CLIP_CONFIG` 变化时重建 CLIP，未变化的模型直接复用；其他配置变化不重载模型。新模型加载成功后与配置一起切换，失败时保留当前模型和配置。替换期间被替换的模型会新旧两份同时存在，需要足够内存/显存。
+- 校验或加载失败的同一份内容不会每轮重试；Nacos 内容再次变化（包括改回后再发布）才重新尝试。
+
+远程不可用时保留当前配置并重试：首次重试间隔为 `NACOS_RETRY_INTERVAL_SECONDS`（默认 5 秒），连续失败按指数退避，最长 `NACOS_RETRY_MAX_INTERVAL_SECONDS`（默认 60 秒），恢复后回到正常轮询间隔。断开期间只在开始时和之后每 5 分钟记录一次 WARNING，其余失败记为 DEBUG，恢复时记录一次。启动时远程不可用会先使用本地配置，后台继续重试；连接恢复后自动切换到 Nacos 配置，无需重启。
 
 端口、日志和 Nacos 连接本身属于启动参数，修改 `constant.py` 后重启生效。模型 YAML 修改后也需要重启；启用 Nacos 轮询时远程模型参数可自动更新。
 
@@ -171,7 +177,7 @@ python scripts/check_nacos.py --profile prod
 python scripts/check_nacos.py --profile test --show-config
 ```
 
-脚本复用 `constant.py` 中对应环境的连接参数、账号、命名空间、group 和 dataId。省略 `--profile` 时沿用服务的环境选择；显式指定 `--profile prod` 会直接选择 prod，不受 `NACOS_ENV` 影响。检查会读取全部 dataId、合并 YAML 并执行与服务相同的基础结构校验，成功返回 0，连接、认证、配置读取或校验失败返回 1，不回退本地 YAML。默认仅输出摘要，`--show-config` 显示原始配置内容。即使设置了 `NACOS_USE_LOCAL`，脚本仍检查远程，并提示服务当前会使用本地配置。
+脚本复用 `constant.py` 中对应环境的连接参数、账号、命名空间、group 和 dataId。省略 `--profile` 时沿用服务的环境选择；显式指定 `--profile prod` 会直接选择 prod，不受 `NACOS_ENV` 影响。检查会读取全部 dataId、合并 YAML 并执行与服务相同的结构和参数校验，成功返回 0，连接、认证、配置读取或校验失败返回 1，不回退本地 YAML。默认仅输出摘要，`--show-config` 显示原始配置内容。即使设置了 `NACOS_USE_LOCAL`，脚本仍检查远程，并提示服务当前会使用本地配置。
 
 脚本只依赖 `requests`、`PyYAML` 和项目配置模块。重新构建镜像后，也可在容器内检查实际部署网络：
 
@@ -346,7 +352,7 @@ python -m unittest discover -s tests -p "test_*.py"
 python tests/check_api.py --provider cuda
 ```
 
-配置检查覆盖本地读取、路径解析、参数校验、Nacos 鉴权重试/本地回退/轮询恢复、模型更新失败保留旧模型及日志格式。Nacos 检查使用模拟响应，不访问真实环境。`tests/test_config.py` 也可以单独运行并写入 JSON 报告：
+配置检查覆盖本地读取、路径解析、参数校验、Nacos 鉴权重试/本地回退/失败退避与恢复/拒绝内容不重试、按组件重载、模型更新失败保留旧模型及日志格式。Nacos 检查使用模拟响应，不访问真实环境。`tests/test_config.py` 也可以单独运行并写入 JSON 报告：
 
 ```powershell
 python tests/test_config.py

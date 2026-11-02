@@ -13,12 +13,13 @@ logger = logging.getLogger("food_service")
 
 
 class Detector:
-    def __init__(self, config_dict):
-        self.load_config(config_dict)
+    def __init__(self, config_dict, dino=None, clip=None):
+        self.load_config(config_dict, dino, clip)
         
-    def load_config(self, config_dict):
-        self.dino = GdinoDetect(config_dict)
-        self.clip = ClipDetect(config_dict)
+    def load_config(self, config_dict, dino=None, clip=None):
+        # 传入已加载的组件时直接复用，配置热更新只重新加载发生变化的模型。
+        self.dino = GdinoDetect(config_dict) if dino is None else dino
+        self.clip = ClipDetect(config_dict) if clip is None else clip
         
     def gDino_filter(self, image_cv, boxes, parases, promt):
         matching_indices = [i for i, label in enumerate(parases) if promt in label]

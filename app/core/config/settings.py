@@ -71,6 +71,7 @@ class NacosSettings:
     request_timeout_seconds: float = c.NACOS_REQUEST_TIMEOUT_SECONDS
     poll_interval_seconds: float = c.NACOS_POLL_INTERVAL_SECONDS
     retry_interval_seconds: float = c.NACOS_RETRY_INTERVAL_SECONDS
+    retry_max_interval_seconds: float = c.NACOS_RETRY_MAX_INTERVAL_SECONDS
     profiles: tuple[c.NacosProfile, ...] = field(default_factory=lambda: c.NACOS_CONFIG_PROFILES)
 
     def __post_init__(self):
@@ -79,7 +80,8 @@ class NacosSettings:
         if self.profile not in {profile["profile"] for profile in self.profiles}:
             raise ValueError("Selected Nacos profile must be configured in NACOS_CONFIG_PROFILES")
         if min(self.connect_timeout_seconds, self.request_timeout_seconds,
-               self.poll_interval_seconds, self.retry_interval_seconds) <= 0:
+               self.poll_interval_seconds, self.retry_interval_seconds,
+               self.retry_max_interval_seconds) <= 0:
             raise ValueError("Nacos timeout and polling intervals must be positive")
 
 

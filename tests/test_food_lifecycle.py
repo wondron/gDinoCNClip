@@ -61,7 +61,7 @@ class FoodLifecycleChecks(unittest.TestCase):
                     patch("app.bootstrap.lifespan.Detector", return_value=service) as build, \
                     patch("app.bootstrap.lifespan.setup_logger"):
                 asyncio.run(exercise(settings))
-            build.assert_called_once_with(self.config)
+            build.assert_called_once_with(self.config, dino=None, clip=None)
         provider.close.assert_called_once()
 
     def test_startup_rejects_failed_clip_before_serving(self):
@@ -85,18 +85,21 @@ class FoodLifecycleChecks(unittest.TestCase):
         self.assertIsNone(app.state.runtime.food_service)
         self.assertIsNone(app.state.runtime.predictor)
 
-    def test_clip_configuration_reload_replaces_the_complete_detector(self):
+    def test_clip_configuration_reload_rebuilds_only_clip_and_reuses_the_loaded_gdino(self):
         app, runtime = self._runtime()
         old_service = runtime.food_service
         changed = copy.deepcopy(self.config)
-        changed["CLIP_CONFIG"]["threads"] = changed["CLIP_CONFIG"].get("threads", 4) + 1
-        replacement = self._detector()
-        with patch("app.bootstrap.lifespan.Detector", return_value=replacement) as build:
+        changed["CLIP_CONFIG"]["detect_range"] = [*changed["CLIP_CONFIG"]["detect_range"], "豆腐"]
+        new_clip = SimpleNamespace(ini_flag=True)
+        with patch("app.domain.food_service.GdinoDetect") as build_dino, \
+                patch("app.domain.food_service.ClipDetect", return_value=new_clip) as build_clip:
             self.assertTrue(apply_nacos_config_update(app, self._snapshot(changed)))
-        build.assert_called_once_with(changed)
+        build_dino.assert_not_called()
+        build_clip.assert_called_once_with(changed)
         self.assertIsNot(runtime.food_service, old_service)
-        self.assertIs(runtime.food_service, replacement)
-        self.assertIs(runtime.predictor, replacement.dino)
+        self.assertIs(runtime.food_service.clip, new_clip)
+        self.assertIs(runtime.food_service.dino, old_service.dino)
+        self.assertIs(runtime.predictor, old_service.dino)
         self.assertIs(runtime.config, changed)
 
     def test_failed_clip_replacement_retains_the_complete_previous_detector(self):
@@ -125,16 +128,23 @@ class FoodLifecycleChecks(unittest.TestCase):
         self.assertIs(runtime.config, changed)
 
     def test_gdino_reload_keeps_both_endpoints_on_the_same_predictor(self):
-        app, runtime = self._runtime()
-        changed = copy.deepcopy(self.config)
-        changed["GROUNDINGDINO_CONFIG"]["short_side"] += 1
-        replacement = self._detector()
-        with patch("app.bootstrap.lifespan.Detector", return_value=replacement) as build:
-            self.assertTrue(apply_nacos_config_update(app, self._snapshot(changed)))
-        build.assert_called_once_with(changed)
-        self.assertIs(runtime.predictor, replacement.dino)
-        self.assertIs(runtime.food_service, replacement)
-        self.assertIs(runtime.config, changed)
+        # device_id 只影响 GroundingDINO 会话，同样只重建 DINO。
+        for section, field in (("GROUNDINGDINO_CONFIG", "short_side"), ("TOTAL_CONFIG", "device_id")):
+            with self.subTest(changed=f"{section}.{field}"):
+                app, runtime = self._runtime()
+                old_service = runtime.food_service
+                changed = copy.deepcopy(self.config)
+                changed[section][field] += 1
+                new_dino = Mock()
+                with patch("app.domain.food_service.GdinoDetect", return_value=new_dino) as build_dino, \
+                        patch("app.domain.food_service.ClipDetect") as build_clip:
+                    self.assertTrue(apply_nacos_config_update(app, self._snapshot(changed)))
+                build_dino.assert_called_once_with(changed)
+                build_clip.assert_not_called()
+                self.assertIs(runtime.predictor, new_dino)
+                self.assertIs(runtime.food_service.dino, new_dino)
+                self.assertIs(runtime.food_service.clip, old_service.clip)
+                self.assertIs(runtime.config, changed)
 
 
 if __name__ == "__main__":

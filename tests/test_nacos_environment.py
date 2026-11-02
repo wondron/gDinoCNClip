@@ -150,11 +150,12 @@ class NacosEnvironmentChecks(unittest.TestCase):
                     self.assertEqual(source["nacos_status"], "fallback")
                     self.assertEqual(source["nacos_profile"], selected["profile"])
                     self.assertTrue(source["nacos_enabled"])
-                    self.assertFalse(source["nacos_polling"])
+                    self.assertTrue(source["nacos_polling"])
                     factory.assert_called_once_with(selected, settings)
                     client.fetch_snapshot.assert_called_once_with()
                     load_local.assert_called_once_with("fallback.yaml")
-                    self.assertIsNone(provider._thread)
+                    # 回退本地后仍在后台重试所选环境，恢复后自动切换。
+                    self.assertTrue(provider._thread.is_alive())
                     on_update.assert_not_called()
 
     def test_client_creation_failure_falls_back_to_yaml(self):
@@ -168,10 +169,10 @@ class NacosEnvironmentChecks(unittest.TestCase):
         self.assertIs(loaded, self.local_config)
         self.assertEqual(source["nacos_status"], "fallback")
         self.assertTrue(source["nacos_enabled"])
-        self.assertFalse(source["nacos_polling"])
+        self.assertTrue(source["nacos_polling"])
         factory.assert_called_once_with(PROFILES[0], settings)
         load_local.assert_called_once_with("fallback.yaml")
-        self.assertIsNone(provider._thread)
+        self.assertTrue(provider._thread.is_alive())
         on_update.assert_not_called()
 
     def test_enabled_still_validates_selected_profile_and_timeouts(self):

@@ -1,6 +1,7 @@
 """Offline configuration, logging and Nacos checks; no GPU or remote service required."""
 
 import copy
+import itertools
 import json
 import logging
 import os
@@ -23,7 +24,7 @@ sys.path.insert(0, str(ROOT))
 from app.bootstrap.lifespan import apply_nacos_config_update
 from app.bootstrap.state import ApplicationState
 from app.core.config.loader import load_config, parse_config_text, prepare_config
-from app.core.config.nacos import NacosConfigClient, NacosConfigProvider, NacosConfigSnapshot
+from app.core.config.nacos import NacosConfigClient, NacosConfigError, NacosConfigProvider, NacosConfigSnapshot
 from app.core.config.settings import NacosSettings, Settings
 from app.core.observability.json_formatter import CustomJsonFormatter
 from app.core.observability.log_helper import trace_id_var
@@ -45,6 +46,23 @@ def response(status=200, text="", payload=None):
     if status >= 400:
         value.raise_for_status.side_effect = requests.HTTPError(f"HTTP {status}")
     return value
+
+
+class ScriptedStop:
+    """Stands in for the poller's stop event: records every delay and stops after `rounds` polls."""
+
+    def __init__(self, rounds):
+        self.rounds, self.delays = rounds, []
+
+    def wait(self, timeout):
+        self.delays.append(timeout)
+        return len(self.delays) > self.rounds
+
+    def set(self):
+        pass
+
+    def clear(self):
+        pass
 
 
 class ConfigurationChecks(unittest.TestCase):
@@ -71,13 +89,18 @@ class ConfigurationChecks(unittest.TestCase):
                 os.chdir(original)
 
     def test_invalid_and_missing_model_parameters_fail_early(self):
+        # 参数在读取配置时校验（本地 YAML 与 Nacos 相同），早于任何模型加载。
         for field, value in (("std", [1, 0, 1]), ("mean", [0, 1]), ("use_gpu", "false"),
-                             ("short_side", 0), ("threads", -1), ("max_text_len", 257)):
+                             ("short_side", 0), ("threads", -1), ("max_text_len", 257),
+                             ("box_threshold", 1.5), ("nms_threshold", -0.1), ("caption", " ")):
             with self.subTest(field=field):
                 config = copy.deepcopy(self.config)
                 config["GROUNDINGDINO_CONFIG"][field] = value
                 with self.assertRaises(ValueError):
-                    self._detector_config(config)
+                    prepare_config(config)
+        disabled_nms = copy.deepcopy(self.config)
+        disabled_nms["GROUNDINGDINO_CONFIG"]["nms_threshold"] = None
+        self.assertIsNone(prepare_config(disabled_nms)["GROUNDINGDINO_CONFIG"]["nms_threshold"])
         with self.assertRaises(ValueError):
             prepare_config({})
         with self.assertRaises(ValueError):
@@ -144,7 +167,8 @@ class ConfigurationChecks(unittest.TestCase):
         self.assertEqual(source["source"], "yaml")
         self.assertEqual(source["nacos_status"], "fallback")
         self.assertEqual(loaded, self.config)
-        self.assertIsNone(provider._thread)
+        # 回退本地后轮询线程继续重试 Nacos，关闭时随之退出。
+        self.assertFalse(provider._thread.is_alive())
         on_update.assert_not_called()
         self.assertNotIn("private-token", "\n".join(logs.output))
 
@@ -176,7 +200,7 @@ class ConfigurationChecks(unittest.TestCase):
         self.assertEqual(loaded, self.config)
         self.assertEqual(source["source"], "yaml")
         self.assertEqual(source["nacos_status"], "fallback")
-        self.assertFalse(source["nacos_polling"])
+        self.assertTrue(source["nacos_polling"])
 
     def test_disabling_polling_preserves_successfully_loaded_nacos_configuration(self):
         cfg = NacosSettings(profile="test", enabled=True, poll_enabled=False, profiles=(PROFILE,))
@@ -196,23 +220,122 @@ class ConfigurationChecks(unittest.TestCase):
         self.assertIsNone(provider._thread)
         load_local.assert_not_called()
 
+    def _raw(self, caption, **model):
+        """Raw payloads for PROFILE's dataIds; the caption makes each version distinct."""
+        gdino = {**self.config["GROUNDINGDINO_CONFIG"], "caption": f"{caption} .", **model}
+        return {"model": yaml.safe_dump({"GROUNDINGDINO_CONFIG": gdino}, allow_unicode=True),
+                "runtime": "TOTAL_CONFIG:\n  device_id: 0\n"}
+
+    def _scripted_provider(self, fetches, *, startup=None):
+        """Provider whose poll loop runs synchronously over scripted fetch results.
+
+        startup is the payload loaded at startup; None simulates Nacos being unreachable then.
+        """
+        client = Mock()
+        if startup is None:
+            client.fetch_snapshot.side_effect = NacosConfigError("Nacos config network request failed")
+        else:
+            client.fetch_snapshot.return_value = NacosConfigSnapshot.from_raw(PROFILE, startup)
+        client.fetch_raw_configs.side_effect = fetches
+        cfg = NacosSettings(profile="test", enabled=True, profiles=(PROFILE,), poll_interval_seconds=10.0,
+                            retry_interval_seconds=5.0, retry_max_interval_seconds=60.0)
+        provider = NacosConfigProvider(cfg, client_factory=lambda *_: client)
+        with patch("app.core.config.nacos.load_config", return_value=self.config), \
+                self.assertLogs("nacos", level="INFO"):
+            provider.load("config/param/config.yaml")
+        provider._stop_event = ScriptedStop(len(fetches))
+        return provider
+
     def test_nacos_poll_recovers_after_temporary_failure(self):
         cfg = NacosSettings(profile="test", enabled=True, poll_enabled=True, profiles=(PROFILE,),
                             poll_interval_seconds=0.01, retry_interval_seconds=0.01)
-        provider = NacosConfigProvider(cfg)
-        initial = NacosConfigSnapshot(self.config, PROFILE, {"model": "one", "runtime": "one"})
-        changed = NacosConfigSnapshot(self.config, PROFILE, {"model": "two", "runtime": "one"})
-        provider._active = initial
-        fetched = Mock(side_effect=[None, changed, changed])
+        changed = self._raw("two")
+        client = Mock()
+        client.fetch_snapshot.return_value = NacosConfigSnapshot.from_raw(PROFILE, self._raw("one"))
+        client.fetch_raw_configs.side_effect = itertools.chain([NacosConfigError("offline")],
+                                                               itertools.repeat(changed))
+        provider = NacosConfigProvider(cfg, client_factory=lambda *_: client)
         complete = threading.Event()
-        with patch.object(provider, "_fetch_selected_profile", fetched):
-            try:
-                provider.start_polling(lambda snapshot: complete.set() or True)
-                self.assertTrue(complete.wait(3), "Polling failed to recover")
-            finally:
-                provider.close()
+        try:
+            provider.load("config/param/config.yaml")
+            provider.start_polling(lambda snapshot: complete.set() or True)
+            self.assertTrue(complete.wait(3), "Polling failed to recover")
+        finally:
+            provider.close()
         self.assertFalse(provider._thread.is_alive())
-        self.assertEqual(provider._active.fingerprint, changed.fingerprint)
+        self.assertIs(provider._active.raw_configs, changed)
+        client.close.assert_called_once_with()
+
+    def test_nacos_poll_retries_after_failures_with_capped_backoff(self):
+        offline = NacosConfigError("Nacos config network request failed")
+        provider = self._scripted_provider([offline] * 6 + [self._raw("one")], startup=self._raw("one"))
+        with self.assertLogs("nacos", level="DEBUG"):
+            provider._poll_loop(Mock())
+        # 失败后只等待重试间隔（不再叠加轮询间隔），随后指数退避到上限，恢复后回到轮询间隔。
+        self.assertEqual(provider._stop_event.delays, [10.0, 5.0, 10.0, 20.0, 40.0, 60.0, 60.0, 10.0])
+
+    def test_nacos_outage_logs_one_warning_periodic_reminders_and_the_recovery(self):
+        provider = self._scripted_provider([NacosConfigError("offline")] * 3 + [self._raw("one")],
+                                           startup=self._raw("one"))
+        with patch("app.core.config.nacos.time") as clock, self.assertLogs("nacos", level="DEBUG") as logs:
+            clock.monotonic.side_effect = [0.0, 100.0, 400.0, 460.0]
+            provider._poll_loop(Mock())
+        failures = [record.levelno for record in logs.records if "poll failed" in record.getMessage()]
+        self.assertEqual(failures, [logging.WARNING, logging.DEBUG, logging.WARNING])
+        recovered = [record.getMessage() for record in logs.records if "poll recovered" in record.getMessage()]
+        self.assertEqual(len(recovered), 1)
+        self.assertIn("failures=3 | outage=460s", recovered[0])
+
+    def test_rejected_nacos_content_is_retried_only_after_the_content_changes(self):
+        one, two, three = self._raw("one"), self._raw("two"), self._raw("three")
+        provider = self._scripted_provider([two, two, two, one, two, three], startup=one)
+        on_update = Mock(side_effect=lambda snapshot: snapshot.raw_configs is three)
+        with self.assertLogs("nacos", level="INFO"):
+            provider._poll_loop(on_update)
+        # 被拒绝的 two 不会每轮重载；内容回到 one 后再次发布 two 才重新尝试。
+        self.assertEqual([call.args[0].raw_configs for call in on_update.call_args_list], [two, two, three])
+        self.assertIs(provider._active.raw_configs, three)
+
+    def test_invalid_nacos_content_during_polling_keeps_the_current_configuration(self):
+        not_mapping = {"model": "- not a configuration mapping\n", "runtime": "TOTAL_CONFIG: {}\n"}
+        float_threads = self._raw("two", threads=4.0)
+        valid = self._raw("three")
+        provider = self._scripted_provider([not_mapping, not_mapping, float_threads, float_threads, valid],
+                                           startup=self._raw("one"))
+        on_update = Mock(return_value=True)
+        with self.assertLogs("nacos", level="INFO") as logs:
+            provider._poll_loop(on_update)
+        on_update.assert_called_once()
+        self.assertIs(provider._active.raw_configs, valid)
+        invalid = [line for line in logs.output if "configuration invalid" in line]
+        self.assertEqual(len(invalid), 2)
+        self.assertIn("threads must be an integer", invalid[1])
+
+    def test_startup_fallback_switches_to_nacos_once_it_becomes_reachable(self):
+        remote = self._raw("remote")
+        provider = self._scripted_provider([NacosConfigError("still offline"), remote])
+        on_update = Mock(return_value=True)
+        with self.assertLogs("nacos", level="DEBUG"):
+            provider._poll_loop(on_update)
+        self.assertEqual(provider._stop_event.delays, [5.0, 10.0, 10.0])
+        snapshot = on_update.call_args.args[0]
+        self.assertEqual(snapshot.config["GROUNDINGDINO_CONFIG"]["caption"], "remote .")
+        self.assertIs(provider._active, snapshot)
+        self.assertEqual(provider.source_info(snapshot)["source"], "nacos")
+
+    def test_nacos_text_is_decoded_as_utf8_without_a_charset_header(self):
+        text = "CLIP_CONFIG:\n  detect_range: [皮皮虾, 鱿鱼]\n"
+        reply = requests.Response()
+        reply.status_code = 200
+        reply.headers["Content-Type"] = "text/plain"
+        reply.encoding = requests.utils.get_encoding_from_headers(reply.headers)  # 与 requests 适配器一致
+        reply._content = text.encode("utf-8")
+        session = Mock()
+        session.request.return_value = reply
+        anonymous = {**PROFILE, "username": "", "password": ""}
+        client = NacosConfigClient(anonymous, NacosSettings(profile="test", enabled=True, profiles=(anonymous,)),
+                                   session)
+        self.assertEqual(client.get_config("model"), text)
 
     def _reload_fixture(self):
         original = SimpleNamespace()
@@ -242,9 +365,11 @@ class ConfigurationChecks(unittest.TestCase):
     def test_successful_reload_publishes_model_and_configuration_together(self):
         app, runtime, _, snapshot, replacement = self._reload_fixture()
         runtime.reload_error = "previous failure"
+        loaded_clip = runtime.food_service.clip
         with patch("app.bootstrap.lifespan.Detector", return_value=replacement) as build:
             self.assertTrue(apply_nacos_config_update(app, snapshot))
-        build.assert_called_once_with(snapshot.config)
+        # 只改了 GroundingDINO 参数：重建 DINO，复用已加载的 CLIP。
+        build.assert_called_once_with(snapshot.config, dino=None, clip=loaded_clip)
         self.assertIs(runtime.predictor, replacement.dino)
         self.assertIs(runtime.food_service, replacement)
         self.assertIs(runtime.config, snapshot.config)
@@ -296,13 +421,14 @@ class ConfigurationChecks(unittest.TestCase):
                 app, runtime, original, snapshot, replacement = self._reload_fixture()
                 runtime.stopping = already_stopping
 
-                def load_while_stopping(config):
+                def load_while_stopping(config, **reused):
                     runtime.stopping = True
                     return replacement
 
                 with patch("app.bootstrap.lifespan.Detector", side_effect=load_while_stopping) as build:
                     self.assertFalse(apply_nacos_config_update(app, snapshot))
                 self.assertEqual(build.call_count, 0 if already_stopping else 1)
+                self.assertIsNone(runtime.reload_error, "rejected by an error instead of the stop flag")
                 self.assertIs(runtime.predictor, original)
                 self.assertIs(runtime.config, self.config)
                 self.assertEqual(runtime.config_info, {"source": "yaml"})

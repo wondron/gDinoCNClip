@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from fastapi.concurrency import run_in_threadpool
 
 from app.bootstrap.state import ApplicationState
+from app.core.config.loader import validate_config
 from app.core.config.nacos import NacosConfigProvider
 from app.core.config.settings import local_path
 from app.core.observability.log_helper import show_text
@@ -33,8 +34,14 @@ def warmup_models(predictor, app_settings):
         predictor.predict(local_path(cfg.image_path), cfg.caption, predictor.box_threshold, predictor.text_threshold)
 
 
-def _build_detector(config):
-    detector = Detector(config)
+def _gdino_config(config):
+    # GroundingDINO 会话除模型参数外还依赖 TOTAL_CONFIG.device_id。
+    return config.get("GROUNDINGDINO_CONFIG"), config.get("TOTAL_CONFIG", {}).get("device_id", 0)
+
+
+def _build_detector(config, *, dino=None, clip=None):
+    # 传入的 dino/clip 是可复用的已加载组件，只加载缺少的模型。
+    detector = Detector(config, dino=dino, clip=clip)
     if not detector.clip.ini_flag:
         raise RuntimeError("CLIP model initialization failed")
     return detector
@@ -45,32 +52,33 @@ def apply_nacos_config_update(app, snapshot):
     if runtime.stopping:
         return False
     try:
-        predictor = runtime.predictor
-        model_changed = not _same_config_value(
-            snapshot.config.get("GROUNDINGDINO_CONFIG"), runtime.config.get("GROUNDINGDINO_CONFIG"),
+        validate_config(snapshot.config)
+        current = runtime.food_service
+        reload_dino = current is None or not _same_config_value(
+            _gdino_config(snapshot.config), _gdino_config(runtime.config),
         )
-        device_changed = not _same_config_value(
-            snapshot.config.get("TOTAL_CONFIG", {}).get("device_id", 0),
-            runtime.config.get("TOTAL_CONFIG", {}).get("device_id", 0),
-        )
-        clip_changed = not _same_config_value(
+        reload_clip = current is None or not _same_config_value(
             snapshot.config.get("CLIP_CONFIG"), runtime.config.get("CLIP_CONFIG"),
         )
-        food_service = runtime.food_service
-        if food_service is None or model_changed or device_changed or clip_changed:
-            food_service = _build_detector(snapshot.config)
-            predictor = food_service.dino
-            warmup_models(predictor, runtime.settings)
+        food_service = current
+        if reload_dino or reload_clip:
+            # 只重新加载配置变化的模型，未变化的直接复用，缩短切换时间并降低内存/显存峰值。
+            food_service = _build_detector(snapshot.config,
+                                           dino=None if reload_dino else current.dino,
+                                           clip=None if reload_clip else current.clip)
+            if reload_dino:
+                warmup_models(food_service.dino, runtime.settings)
         with runtime.lock:
             if runtime.stopping:
                 return False
             runtime.config = snapshot.config
             runtime.config_info = runtime.config_provider.source_info(snapshot)
-            runtime.predictor = predictor
+            runtime.predictor = food_service.dino
             runtime.food_service = food_service
             runtime.reload_error = None
-        logger.info("Nacos 配置更新完成 | profile=%s", snapshot.profile["profile"])
-        show_text("Nacos 配置更新完成", profile=snapshot.profile["profile"])
+        reloaded = ",".join(name for name, flag in (("GroundingDINO", reload_dino), ("CLIP", reload_clip)) if flag)
+        logger.info("Nacos 配置更新完成 | profile=%s | reloaded=%s", snapshot.profile["profile"], reloaded or "none")
+        show_text(f"Nacos 配置更新完成 | reloaded={reloaded or 'none'}", profile=snapshot.profile["profile"])
         return True
     except Exception as exc:
         runtime.reload_error = f"{type(exc).__name__}: {exc}"
