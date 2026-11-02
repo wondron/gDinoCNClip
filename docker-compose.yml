@@ -1,6 +1,6 @@
 services:
   fooddetector:
-    image: aliyun-docker-harbor-registry.cn-hangzhou.cr.aliyuncs.com/roki-ai/roki-ai-food-detector-model:20250609
+    image: aliyun-docker-harbor-registry.cn-hangzhou.cr.aliyuncs.com/roki-ai/roki-ai-food-detector-model:20261102   
     container_name: food_detector
     environment:
       # 空值使用 prod，任意非空值使用 test。

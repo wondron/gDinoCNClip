@@ -1,8 +1,8 @@
-ARG PYTHON_IMAGE=python:3.11-slim-bookworm
+ARG PYTHON_IMAGE=ghcr.io/astral-sh/uv:python3.11-bookworm-slim
 FROM ${PYTHON_IMAGE}
 
 # Override with --build-arg PIP_INDEX_URL=<mirror> when building behind a slow network.
-ARG PIP_INDEX_URL=https://pypi.org/simple
+ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
