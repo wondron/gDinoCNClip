@@ -1,8 +1,8 @@
 """Exercise the original HTTP contract against the real ONNX service/model.
 
 Run from any directory: python 1-Onnx/tests/check_api.py --provider cuda
-All uploaded images and the temporary test configuration stay in a dedicated
-system temporary directory. The project's upload directories are not touched.
+All saved result images and the temporary test configuration stay in a dedicated
+system temporary directory. The project's image directories are not touched.
 """
 
 import argparse
@@ -107,6 +107,7 @@ def run(args, report):
                 paths=replace(
                     app_settings.paths,
                     save_images_dir=str(temporary_root / "images"),
+                    save_result_dir=str(temporary_root / "save_res"),
                     output_dir=str(BUNDLE_ROOT / "output/test_runs" / temporary_root.name),
                 ),
                 nacos=replace(app_settings.nacos, enabled=False),
@@ -132,8 +133,10 @@ def run(args, report):
                     schema = _resolve_reference(
                         document, operation["requestBody"]["content"]["multipart/form-data"]["schema"],
                     )
-                    assert set(schema["properties"]) == FIELDS, schema
+                    assert set(schema["properties"]) == FIELDS | {"save_result"}, schema
                     assert set(schema["required"]) == FIELDS, schema
+                    assert schema["properties"]["save_result"]["type"] == "boolean", schema
+                    assert schema["properties"]["save_result"]["default"] is False, schema
                     image_schema = schema["properties"]["image"]
                     assert image_schema["type"] == "string"
                     # FastAPI/Pydantic may represent an uploaded file with the
@@ -152,8 +155,10 @@ def run(args, report):
                     schema = _resolve_reference(
                         document, operation["requestBody"]["content"]["multipart/form-data"]["schema"],
                     )
-                    assert set(schema["properties"]) == FOOD_FIELDS, schema
+                    assert set(schema["properties"]) == FOOD_FIELDS | {"save_result"}, schema
                     assert set(schema["required"]) == FOOD_FIELDS, schema
+                    assert schema["properties"]["save_result"]["type"] == "boolean", schema
+                    assert schema["properties"]["save_result"]["default"] is False, schema
                     for name in ("dino_cap", "clip_cap"):
                         assert schema["properties"][name]["type"] == "string", schema
                     for name in ("dino_box", "dino_text", "clip_thre"):
@@ -170,42 +175,94 @@ def run(args, report):
                     assert previous.is_file(), f"OpenAPI fixture missing: {previous}"
                     old = json.loads(previous.read_text(encoding="utf-8"))
                     new = service.app.openapi()
-                    assert old["paths"]["/process/"]["post"] == new["paths"]["/process/"]["post"], \
-                        "Original /process/ operation changed"
+                    old_operation = old["paths"]["/process/"]["post"]
+                    new_operation = new["paths"]["/process/"]["post"]
+                    assert old_operation["responses"] == new_operation["responses"], \
+                        "Original /process/ response contract changed"
+                    old_body = old_operation["requestBody"]
+                    new_body = new_operation["requestBody"]
+                    assert old_body["required"] == new_body["required"]
+                    assert set(old_body["content"]) == set(new_body["content"])
+                    old_fields = _resolve_reference(old, old_body["content"]["multipart/form-data"]["schema"])
+                    new_fields = _resolve_reference(new, new_body["content"]["multipart/form-data"]["schema"])
+                    assert set(old_fields["required"]) == set(new_fields["required"]), \
+                        "Original required fields changed"
+                    for name, schema in old_fields["properties"].items():
+                        assert new_fields["properties"][name] == schema, f"Original field changed: {name}"
+                    assert set(new_fields["properties"]) == set(old_fields["properties"]) | {"save_result"}
                     old_schemas = old.get("components", {}).get("schemas", {})
                     new_schemas = new.get("components", {}).get("schemas", {})
                     for name, schema in old_schemas.items():
+                        if schema is old_fields:
+                            continue  # The form adds only the optional field checked above.
                         assert new_schemas.get(name) == schema, f"Original schema changed: {name}"
-                    return {"original_process_operation_equal": True,
-                            "original_component_schemas_equal": sorted(old_schemas)}
+                    return {"original_required_fields_preserved": sorted(old_fields["required"]),
+                            "original_response_contract_preserved": True,
+                            "optional_save_result_added": True}
                 _check(report, "openapi_original_contract_preserved", previous_schema_test)
                 _check(report, "no_pytorch_import_at_startup", _assert_no_torch)
 
                 def success_and_roundtrip():
                     upload_directory = service.app.state.runtime.upload_dir
-                    before = set(upload_directory.glob("*.jpg"))
+                    before = set(temporary_root.rglob("*.jpg"))
                     result = _assert_response(post(), 200)
                     assert set(result) == RESULT_FIELDS, result.keys()
                     count = len(result["boxes"])
                     assert count > 0, "The real positive image must yield detections"
                     assert count == len(result["phrases"]) == len(result["logits"])
-                    saved = set(upload_directory.glob("*.jpg")) - before
-                    assert len(saved) == 1, saved
-                    uploaded_path = saved.pop()
+                    assert set(temporary_root.rglob("*.jpg")) == before, \
+                        "A request without save_result must not save images"
+                    assert not upload_directory.exists(), "Uploaded images must not be written to disk"
                     expected_jpeg = io.BytesIO()
                     with Image.open(io.BytesIO(image_bytes)) as source:
                         if source.mode in ("RGBA", "P", "LA", "PA"):
                             source = source.convert("RGB")
                         source.save(expected_jpeg, format="JPEG", quality=95)
-                    assert uploaded_path.read_bytes() == expected_jpeg.getvalue(), "JPEG quality-95 round trip differs"
-                    reference = predictor.predict(uploaded_path, FORM["discri"], 0.35, 0.25)
+                    expected_jpeg.seek(0)
+                    with Image.open(expected_jpeg) as source:
+                        decoded_image = source.convert("RGB")
+                    try:
+                        reference = predictor.predict(decoded_image, FORM["discri"], 0.35, 0.25)
+                    finally:
+                        decoded_image.close()
                     assert result["phrases"] == reference["phrases"]
                     np.testing.assert_allclose(result["boxes"], reference["boxes"], atol=1e-6, rtol=1e-6)
                     np.testing.assert_allclose(result["logits"], reference["logits"], atol=1e-6, rtol=1e-6)
                     return {"positive_detections": count, "response_fields": sorted(result),
-                            "jpeg_quality_95_bytes_equal": True, "http_direct_prediction_tolerance": 1e-6}
+                            "no_images_saved_by_default": True,
+                            "http_jpeg_quality_95_prediction_tolerance": 1e-6}
 
-                _check(report, "positive_image_and_saved_jpeg_prediction", success_and_roundtrip)
+                _check(report, "positive_image_and_in_memory_jpeg_prediction", success_and_roundtrip)
+
+                def save_result_test():
+                    result_directory = service.app.state.runtime.result_dir
+                    saved_paths = []
+                    with Image.open(io.BytesIO(image_bytes)) as source:
+                        expected_size = source.size
+                    for _ in range(2):
+                        before = set(result_directory.glob("*.jpg"))
+                        result = _assert_response(post(data={**FORM, "save_result": "true"}), 200)
+                        assert set(result) == RESULT_FIELDS, result.keys()
+                        saved = set(result_directory.glob("*.jpg")) - before
+                        assert len(saved) == 1, saved
+                        destination = saved.pop()
+                        with Image.open(destination) as image:
+                            assert image.format == "JPEG"
+                            assert image.size == expected_size
+                            image.load()
+                        saved_paths.append(destination)
+                    assert len(set(saved_paths)) == 2, "Saved results must have unique names"
+                    assert not service.app.state.runtime.upload_dir.exists()
+                    before = set(temporary_root.rglob("*.jpg"))
+                    _assert_response(post(data={**FORM, "save_result": "false"}), 200)
+                    assert set(temporary_root.rglob("*.jpg")) == before
+                    return {"saved_results": len(saved_paths), "unique_names": True,
+                            "explicit_false_saves_no_images": True}
+
+                _check(report, "optional_save_result_images", save_result_test)
+                _check(report, "invalid_save_result_422", lambda: _assert_response(
+                    post(data={**FORM, "save_result": "not-a-bool"}), 422,
+                ))
 
                 def rgba_test():
                     with Image.open(io.BytesIO(image_bytes)) as source:

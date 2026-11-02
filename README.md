@@ -47,8 +47,9 @@
   output/
     logs/app.log                       # 普通运行日志
     logs/platform.log                  # 每行一条 JSON 的平台日志
-    images/                            # HTTP 上传后的 JPEG 图片
+    save_res/                          # save_result=true 时保存的标注结果图
   scripts/
+    check_nacos.py                      # 独立检查 Nacos 连接和配置读取
     infer.py                           # 直接推理 CLI
     infer_folder.py                    # 独立单文件：目录批量推理、结果和耗时 JSON
     test_api.py                        # HTTP 调用和结果标注示例
@@ -85,7 +86,7 @@ GroundingDINO 模型约 661 MiB，batch=1，图片宽高动态，文本最多 25
 | `LOG_BACKUP_COUNT` | 日志按天轮转，保留 15 份历史文件 |
 | `LOG_TIMEZONE_OFFSET_HOURS` | 日志与轮转时区，默认 UTC+8，与参考项目一致 |
 | `OUTPUT_DIR` | 日志输出根目录，`output` |
-| `SAVE_IMAGES_DIR` / `SAVE_IMAGES_ENABLED` | 上传图片目录、是否保留图片 |
+| `SAVE_RESULT_DIR` | 标注结果图目录，`output/save_res`；请求 `save_result=true` 时才保存 |
 | `JPEG_QUALITY` | 上传图片重编码质量，默认 95 |
 | `WARMUP_ENABLED` / `WARMUP_RUNS` | 启动预热开关和次数，默认关闭 |
 | `NACOS_*` | Nacos 连接信息及轮询间隔；本地读取开关与环境选择通过环境变量设置 |
@@ -162,6 +163,22 @@ NACOS_ENV=test docker compose up -d --build
 
 端口、日志和 Nacos 连接本身属于启动参数，修改 `constant.py` 后重启生效。模型 YAML 修改后也需要重启；启用 Nacos 轮询时远程模型参数可自动更新。
 
+可独立检查 Nacos 是否能够读取配置，无需启动服务或加载模型：
+
+```bash
+python scripts/check_nacos.py --profile test
+python scripts/check_nacos.py --profile prod
+python scripts/check_nacos.py --profile test --show-config
+```
+
+脚本复用 `constant.py` 中对应环境的连接参数、账号、命名空间、group 和 dataId。省略 `--profile` 时沿用服务的环境选择；显式指定 `--profile prod` 会直接选择 prod，不受 `NACOS_ENV` 影响。检查会读取全部 dataId、合并 YAML 并执行与服务相同的基础结构校验，成功返回 0，连接、认证、配置读取或校验失败返回 1，不回退本地 YAML。默认仅输出摘要，`--show-config` 显示原始配置内容。即使设置了 `NACOS_USE_LOCAL`，脚本仍检查远程，并提示服务当前会使用本地配置。
+
+脚本只依赖 `requests`、`PyYAML` 和项目配置模块。重新构建镜像后，也可在容器内检查实际部署网络：
+
+```bash
+docker compose exec fooddetector python3.11 scripts/check_nacos.py --profile test
+```
+
 ## 启动
 
 依赖仅保留一份根目录 `requirements.txt`，用于 Linux x86_64 GPU 部署，使用 Python 3.10/3.11、glibc ≥ 2.27：
@@ -234,7 +251,7 @@ print(boxes, phrases, logits)
 
 提示词也可直接传入字符串，例如 `"glass . straw . lemon ."`。省略时使用配置中的 `caption`；`detect()` 返回 `(boxes, logits, phrases)`，其中 `boxes` 为归一化 `cxcywh` 的 NumPy 数组，支持列表索引筛选；无检测时形状为 `(0, 4)`。`predict()` 和 `predict_with_metadata()` 保留 HTTP 与 CLI 使用的字典结果格式。
 
-接口保持 **`POST /process/`**，`multipart/form-data` 必传 `image`、`discri`、`box_thre`、`text_thre`。两个阈值由调用方传入，不会被配置文件替换。
+接口保持 **`POST /process/`**，`multipart/form-data` 必传 `image`、`discri`、`box_thre`、`text_thre`。两个阈值由调用方传入，不会被配置文件替换。可选字段 `save_result` 默认为 `false`，原调用无需增加参数。
 
 ```python
 import requests
@@ -252,11 +269,11 @@ print(response.json())
 
 成功 JSON 仅包含 `boxes`、`phrases`、`logits`。框格式为归一化 `[中心x, 中心y, 宽, 高]`。无检测时返回三个空列表。非图片和损坏图片返回 400，缺少表单字段/浮点数格式错误返回 422，推理异常返回 500。
 
-HTTP 保留原来的 JPEG quality=95 重编码后再推理流程。默认短边 800、长边最多 1333、ImageNet 归一化，不增加 NMS。`SAVE_IMAGES_ENABLED = False` 会在推理后清理本次 JPEG，编码流程仍执行。
+HTTP 保留原来的 JPEG quality=95 重编码后再推理流程，编码和解码均在内存中执行，不保存上传图片。默认短边 800、长边最多 1333、ImageNet 归一化，不增加 NMS。只有 `save_result=true` 时才绘制并保存结果图，保存位置为项目目录下的 `output/save_res/<唯一文件名>.jpg`，目录按需创建。原 `SAVE_IMAGES_DIR` / `SAVE_IMAGES_ENABLED` 仅作为旧配置兼容项保留，HTTP 图像保存统一由 `save_result` 控制。
 
 ### 食材检测 `/food_detect/`
 
-`POST /food_detect/` 使用 `multipart/form-data`，必传 `image`、`dino_cap`、`dino_box`、`dino_text`、`clip_cap`、`clip_thre` 六个字段。业务流程位于 `food_service.Detector.detect()`，直接解码原始上传字节：先调用 `dino.detect(image, caption, box_threshold, text_threshold)`，再调用 `clip.batch_detect(image, boxes, caption, threshold)` 筛选候选框。
+`POST /food_detect/` 使用 `multipart/form-data`，必传 `image`、`dino_cap`、`dino_box`、`dino_text`、`clip_cap`、`clip_thre` 六个字段。可选字段 `save_result` 默认为 `false`，不传时不绘图、不保存图片。业务流程位于 `food_service.Detector.detect()`，直接解码原始上传字节：先调用 `dino.detect(image, caption, box_threshold, text_threshold)`，再调用 `clip.batch_detect(image, boxes, caption, threshold)` 筛选候选框。
 
 ```python
 import requests
@@ -272,6 +289,8 @@ with open("config/images/test.jpg", "rb") as image:
 response.raise_for_status()
 print(response.json())
 ```
+
+需要保存标注结果时，在上面的 `data` 中增加 `"save_result": "true"`。结果图保存到服务所在机器的 `output/save_res/<唯一文件名>.jpg`，包含最终筛选后的检测框和置信度；CLIP 模式和仅 DINO 模式均支持，接口响应字段保持不变。省略该参数或传 `false` 时不会创建结果目录、不会覆盖根目录的 `test.jpg`。
 
 `clip_thre > 0` 时，裁剪 DINO 候选框并按 `batch_size` 分批，与 `clip_cap` 一起输入 CLIP 合并模型。文本每次请求分词一次；每批候选图像推理时，模型同时计算图像、文本特征，无需特征库或 JSONL 文件。图文特征归一化后计算余弦相似度，使用 `clip((cosine + 1) / 2, 0, 1)` 作为分数，只保留分数严格大于 `clip_thre` 的框。分数范围为 `0～1`；旧的 `21` 这类原始分数阈值会返回 422。CLIP 随 `Detector` 一起初始化，通过 YAML 的 `CLIP_CONFIG.model_path` 加载单个 ONNX 模型及同目录的配套 JSON。
 

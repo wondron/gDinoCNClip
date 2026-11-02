@@ -89,7 +89,6 @@ def create_lifespan(app_settings):
             config, source = await run_in_threadpool(provider.load, app_settings.config.yaml_path)
             runtime = ApplicationState(app_settings, config, source, provider)
             app.state.runtime = runtime
-            runtime.upload_dir.mkdir(parents=True, exist_ok=True)
             logger.info("服务启动 | service=%s | config_source=%s | yaml=%s",
                         app_settings.application.service_name, source["source"],
                         local_path(app_settings.config.yaml_path))

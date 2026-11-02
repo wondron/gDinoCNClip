@@ -29,5 +29,9 @@ class ApplicationState:
     lock: Lock = field(default_factory=Lock, init=False, repr=False)
 
     @property
+    def result_dir(self) -> Path:
+        return local_path(self.settings.paths.save_result_dir)
+
+    @property
     def upload_dir(self) -> Path:
         return local_path(self.settings.paths.save_images_dir)

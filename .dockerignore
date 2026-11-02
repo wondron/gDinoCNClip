@@ -11,7 +11,8 @@ output/
 reports/
 tests/
 tools/
-scripts/
+scripts/*
+!scripts/check_nacos.py
 .env
 .env.*
 *.pt

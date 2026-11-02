@@ -40,6 +40,7 @@ class PathSettings:
     save_images_dir: str = c.SAVE_IMAGES_DIR
     save_images_enabled: bool = c.SAVE_IMAGES_ENABLED
     jpeg_quality: int = c.JPEG_QUALITY
+    save_result_dir: str = c.SAVE_RESULT_DIR
 
 
 @dataclass(frozen=True, slots=True)

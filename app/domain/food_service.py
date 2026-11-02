@@ -30,7 +30,8 @@ class Detector:
     def detect(self, image_data, dino_caption, dino_box_thre, dino_text_thre, clip_caption, clip_thre):
         try:
             timer = timer_tool()
-            image = Image.open(io.BytesIO(image_data)).convert("RGB")
+            with Image.open(io.BytesIO(image_data)) as source:
+                image = source.convert("RGB")
             timer.mark("load image")
             boxes, _, parases = self.dino.detect(image, dino_caption, dino_box_thre, dino_text_thre) 
             timer.mark("dino detect")
@@ -41,7 +42,6 @@ class Detector:
             timer.mark("clip detect")
             logging.info(f"{timer.summary()}")
             show_text(timer.summary())
-            self.draw_result(image_data, rects, confident)
             return rects, confident
         except Exception as e:
             print(f"An error occurred: {e}")
@@ -78,7 +78,7 @@ class Detector:
             draw.rectangle((label_x, label_y, label_x + label_width,
                             label_y + label_height), fill="red")
             draw.text((label_x + 2 - left, label_y + 2 - top), label, fill="white")
-        image.save("test.jpg")
+        return image
 
     
 if __name__ == '__main__':

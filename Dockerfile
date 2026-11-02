@@ -42,6 +42,7 @@ COPY app/ ./app/
 COPY config/param/ ./config/param/
 COPY config/images/ ./config/images/
 COPY main.py ./
+COPY scripts/check_nacos.py ./scripts/check_nacos.py
 
 RUN mkdir -p /app/output
 
