@@ -88,6 +88,7 @@ def setup_logger(save_to_file=None, save_k8s_file=None, *, app_settings=settings
             handler.close()
         target.propagate = True
     logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+    logging.getLogger("http").setLevel(logging.WARNING)
     logging.captureWarnings(True)
     root.info("日志初始化完成 | output=%s | file=%s | platform_stdout=%s",
               local_path(app_settings.paths.output_dir), save_to_file, save_k8s_file)
