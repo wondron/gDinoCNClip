@@ -63,7 +63,8 @@ class WarmupSettings:
 @dataclass(frozen=True, slots=True)
 class NacosSettings:
     profile: str = field(default_factory=_nacos_profile)
-    enabled: bool = field(default_factory=lambda: c.NACOS_ENABLED)
+    # 按变量是否存在判断；空值也表示使用本地 YAML。
+    enabled: bool = field(default_factory=lambda: "NACOS_USE_LOCAL" not in os.environ)
     poll_enabled: bool = c.NACOS_POLL_ENABLED
     connect_timeout_seconds: float = c.NACOS_CONNECT_TIMEOUT_SECONDS
     request_timeout_seconds: float = c.NACOS_REQUEST_TIMEOUT_SECONDS

@@ -1,6 +1,7 @@
 """部署时修改这里的启动参数；模型参数位于 config/param/config.yaml。
 
-修改后重启服务。Nacos 参数留空，填写后将 NACOS_ENABLED 改为 True。
+修改后重启服务。默认读取 Nacos，失败时回退本地 YAML；
+设置环境变量 NACOS_USE_LOCAL 后直接读取本地 YAML。
 """
 
 from pathlib import Path
@@ -44,7 +45,6 @@ class NacosProfile(TypedDict):
     data_id_list: list[str]
 
 
-NACOS_ENABLED = False  # 总开关：False 时直接读取本地 YAML
 NACOS_DEFAULT_PROFILE = "prod"  # NACOS_ENV 未设置或为空用 prod，非空用 test
 NACOS_POLL_ENABLED = True
 NACOS_CONNECT_TIMEOUT_SECONDS = 2.0

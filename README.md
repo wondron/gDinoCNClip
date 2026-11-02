@@ -88,7 +88,7 @@ GroundingDINO 模型约 661 MiB，batch=1，图片宽高动态，文本最多 25
 | `SAVE_IMAGES_DIR` / `SAVE_IMAGES_ENABLED` | 上传图片目录、是否保留图片 |
 | `JPEG_QUALITY` | 上传图片重编码质量，默认 95 |
 | `WARMUP_ENABLED` / `WARMUP_RUNS` | 启动预热开关和次数，默认关闭 |
-| `NACOS_*` | Nacos 开关、环境、连接信息及轮询间隔 |
+| `NACOS_*` | Nacos 连接信息及轮询间隔；本地读取开关与环境选择通过环境变量设置 |
 
 模型配置位于 **`config/param/config.yaml`**，与参考项目采用 `TOTAL_CONFIG.device_id`、`model_path`、`use_gpu`、`mean/std` 的方式一致：
 
@@ -128,27 +128,35 @@ CLIP 从 `model_path` 所在目录读取配套的模型、图像预处理和分�
 
 运行 `python -m app.domain.pipeline.a_gdinoDtct` 可直接检测 YAML 中的 `test_image_path`，使用配置中的 `caption` 和阈值。
 
-通过环境变量 `GROUNDING_ONNX_CONFIG` 可指定其他 YAML 文件，适用于服务和单图脚本 `scripts/infer.py`。单图脚本读取本地 YAML；服务启用 Nacos 后，优先使用所选环境的远程配置，获取失败才回退本地 YAML。远程多个 dataId 按列表顺序合并，后面的同名参数覆盖前面的参数。独立批量脚本 `scripts/infer_folder.py` 不读取 YAML 或 `constant.py`。
+通过环境变量 `GROUNDING_ONNX_CONFIG` 可指定其他 YAML 文件，适用于服务和单图脚本 `scripts/infer.py`。单图脚本读取本地 YAML；服务默认优先使用所选环境的 Nacos 配置，获取失败时回退本地 YAML，设置 `NACOS_USE_LOCAL` 则直接读取本地 YAML。远程多个 dataId 按列表顺序合并，后面的同名参数覆盖前面的参数。独立批量脚本 `scripts/infer_folder.py` 不读取 YAML 或 `constant.py`。
 
 ### Nacos
 
-在 `constant.py` 中填写 `NACOS_CONFIG_PROFILES` 的 `prod` / `test`：`server_addresses`、`namespace`、`username`、`password`、`group`、`data_id_list`，再设置 `NACOS_ENABLED = True`。当前连接参数留空，默认关闭，不会请求参考项目的 Nacos 服务。
+在 `constant.py` 中填写 `NACOS_CONFIG_PROFILES` 的 `prod` / `test`：`server_addresses`、`namespace`、`username`、`password`、`group`、`data_id_list`。服务默认读取 Nacos，读取失败时回退本地 YAML；当前连接参数留空，因此会直接回退本地文件。
 
-`constant.py` 的 `NACOS_ENABLED` 是总开关，环境变量不能覆盖它。启用后，根据 `NACOS_ENV` 是否非空选择连接配置：
+通过环境变量 `NACOS_USE_LOCAL` 控制是否直接读取本地 YAML，按变量是否存在判断：即使值为空、`false` 或 `0`，也表示本地读取。恢复 Nacos 读取需要移除该变量。原 `NACOS_ENABLED` 常量开关已移除。读取 Nacos 时，根据 `NACOS_ENV` 是否非空选择连接配置：
 
-| `NACOS_ENABLED` | `NACOS_ENV` | 配置来源 |
+| `NACOS_USE_LOCAL` | `NACOS_ENV` | 配置来源 |
 | --- | --- | --- |
-| `False` | 任意值或未设置 | 直接读取本地 YAML，不连接 Nacos |
-| `True` | 未设置、空值或全空白 | Nacos `prod`，不可用时回退本地 YAML |
-| `True` | 任意非空值 | Nacos `test`，不可用时回退本地 YAML |
+| 已设置（包括空值） | 任意值或未设置 | 直接读取本地 YAML，不连接 Nacos |
+| 未设置 | 未设置、空值或全空白 | Nacos `prod`，不可用时回退本地 YAML |
+| 未设置 | 任意非空值 | Nacos `test`，不可用时回退本地 YAML |
 
-`NACOS_ENV` 只作为测试环境标识，不按 `prod/test` 枚举解析。Compose 默认将它传为空值，因此启用 Nacos 后默认连接 `prod`。测试部署可执行：
+Compose 使用不带默认值的 `NACOS_USE_LOCAL` 条目透传宿主机变量；宿主机未设置时，容器中也不会设置此变量。直接读取本地 YAML 可执行：
+
+```bash
+NACOS_USE_LOCAL=1 docker compose up -d
+```
+
+也可在 `docker-compose.yml` 的 `environment` 列表中直接设置 `- NACOS_USE_LOCAL=1`。不要使用 `NACOS_USE_LOCAL=${NACOS_USE_LOCAL:-}`，因为这会在宿主机未设置时仍注入空值，导致始终本地读取。
+
+`NACOS_ENV` 只作为测试环境标识，不按 `prod/test` 枚举解析。Compose 默认将它传为空值，因此未设置 `NACOS_USE_LOCAL` 时默认连接 `prod`。测试部署可执行（宿主机未设置 `NACOS_USE_LOCAL`）：
 
 ```bash
 NACOS_ENV=test docker compose up -d --build
 ```
 
-也可将 `docker-compose.yml` 中的 `NACOS_ENV` 直接设为 `"test"`；移除该环境变量或置空即可恢复 `prod`。连接地址、命名空间和账号等参数仍从 `constant.py` 的对应配置读取；修改此文件后，Docker 部署需重新构建镜像。Nacos 中的 YAML 结构与本地 `config/param/config.yaml` 相同，模型路径指向部署机器的文件。
+也可将 `docker-compose.yml` 中的 `NACOS_ENV` 条目直接改为 `- NACOS_ENV=test`；移除该环境变量或置空即可恢复 `prod`。连接地址、命名空间和账号等参数仍从 `constant.py` 的对应配置读取；修改此文件后，Docker 部署需重新构建镜像。Nacos 中的 YAML 结构与本地 `config/param/config.yaml` 相同，模型路径指向部署机器的文件。
 
 服务使用普通 GET 轮询，默认每 10 秒检查配置变化。参数变化时先加载替换模型；成功后切换，失败时保留当前模型。远程暂时不可用时保留当前配置并重试。模型变更期间可能同时存在两个会话，需要足够内存/显存。启动时远程不可用会使用本地配置，本次进程不启动远程轮询；连接恢复后重启以重新加载远程配置。
 

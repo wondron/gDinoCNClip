@@ -4,6 +4,8 @@ import os
 import unittest
 from unittest.mock import Mock, patch
 
+import requests
+
 from app.core.config import constant
 from app.core.config.nacos import NacosConfigError, NacosConfigProvider, NacosConfigSnapshot
 from app.core.config.settings import NacosSettings
@@ -32,10 +34,11 @@ class NacosEnvironmentChecks(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def settings(self, marker=None, *, enabled=True, **kwargs):
+    def settings(self, marker=None, *, local_marker=None, **kwargs):
         environment = {} if marker is None else {"NACOS_ENV": marker}
-        with patch.dict(os.environ, environment, clear=True), \
-                patch.object(constant, "NACOS_ENABLED", enabled):
+        if local_marker is not None:
+            environment["NACOS_USE_LOCAL"] = local_marker
+        with patch.dict(os.environ, environment, clear=True):
             return NacosSettings(**{"profiles": PROFILES, **kwargs})
 
     def provider(self, settings, factory):
@@ -56,17 +59,24 @@ class NacosEnvironmentChecks(unittest.TestCase):
             with self.subTest(marker=marker):
                 self.assertEqual(self.settings(marker).profile, "test")
 
-    def test_constant_is_the_enable_switch_regardless_of_environment(self):
-        for enabled in (False, True):
-            with self.subTest(enabled=enabled), \
-                    patch.dict(os.environ, {"NACOS_ENV": "test", "NACOS_ENABLED": str(not enabled)}, clear=True), \
-                    patch.object(constant, "NACOS_ENABLED", enabled):
-                self.assertIs(NacosSettings(profiles=PROFILES).enabled, enabled)
+    def test_local_environment_presence_disables_nacos_regardless_of_value(self):
+        for marker in ("", " ", "\t\n", "false", "0", "true", "1", "anything"):
+            with self.subTest(local_marker=marker):
+                self.assertFalse(self.settings(local_marker=marker).enabled)
+
+    def test_environment_is_evaluated_when_settings_are_constructed(self):
+        self.assertTrue(self.settings().enabled)
+        self.assertFalse(self.settings(local_marker="").enabled)
+        self.assertTrue(self.settings().enabled)
+
+    def test_explicit_enabled_setting_remains_supported(self):
+        self.assertFalse(self.settings(enabled=False).enabled)
+        self.assertTrue(self.settings(local_marker="1", enabled=True).enabled)
 
     def test_disabled_loads_yaml_without_creating_a_client_or_polling(self):
-        for marker in (None, "test", "prod"):
-            with self.subTest(marker=marker):
-                settings = self.settings(marker, enabled=False)
+        for marker, local_marker in ((None, ""), ("test", "1"), ("prod", "false")):
+            with self.subTest(marker=marker, local_marker=local_marker):
+                settings = self.settings(marker, local_marker=local_marker)
                 factory = Mock()
                 provider = self.provider(settings, factory)
                 on_update = Mock()
@@ -85,7 +95,7 @@ class NacosEnvironmentChecks(unittest.TestCase):
 
     def test_disabled_ignores_remote_only_profile_and_timeout_validation(self):
         settings = self.settings(
-            "test", enabled=False, profile="unconfigured", profiles=(),
+            "test", local_marker="", profile="unconfigured", profiles=(),
             connect_timeout_seconds=0, request_timeout_seconds=0,
             poll_interval_seconds=0, retry_interval_seconds=0,
         )
@@ -123,25 +133,46 @@ class NacosEnvironmentChecks(unittest.TestCase):
 
     def test_selected_profile_failure_falls_back_to_yaml_without_trying_other_profile(self):
         for marker, selected in ((None, PROFILES[0]), ("configured", PROFILES[1])):
-            with self.subTest(marker=marker):
-                settings = self.settings(marker)
-                client = Mock()
-                client.fetch_snapshot.side_effect = NacosConfigError("offline")
-                factory = Mock(return_value=client)
-                provider = self.provider(settings, factory)
-                on_update = Mock()
-                with patch("app.core.config.nacos.load_config", return_value=self.local_config) as load_local:
-                    loaded, source = provider.load("fallback.yaml")
-                    provider.start_polling(on_update)
-                self.assertIs(loaded, self.local_config)
-                self.assertEqual(source["source"], "yaml")
-                self.assertEqual(source["nacos_status"], "fallback")
-                self.assertEqual(source["nacos_profile"], selected["profile"])
-                self.assertFalse(source["nacos_polling"])
-                factory.assert_called_once_with(selected, settings)
-                load_local.assert_called_once_with("fallback.yaml")
-                self.assertIsNone(provider._thread)
-                on_update.assert_not_called()
+            for error in (NacosConfigError("offline"), NacosConfigError("dataId is missing"),
+                          requests.Timeout("timed out"), ValueError("invalid YAML")):
+                with self.subTest(marker=marker, error=error):
+                    settings = self.settings(marker)
+                    client = Mock()
+                    client.fetch_snapshot.side_effect = error
+                    factory = Mock(return_value=client)
+                    provider = self.provider(settings, factory)
+                    on_update = Mock()
+                    with patch("app.core.config.nacos.load_config", return_value=self.local_config) as load_local:
+                        loaded, source = provider.load("fallback.yaml")
+                        provider.start_polling(on_update)
+                    self.assertIs(loaded, self.local_config)
+                    self.assertEqual(source["source"], "yaml")
+                    self.assertEqual(source["nacos_status"], "fallback")
+                    self.assertEqual(source["nacos_profile"], selected["profile"])
+                    self.assertTrue(source["nacos_enabled"])
+                    self.assertFalse(source["nacos_polling"])
+                    factory.assert_called_once_with(selected, settings)
+                    client.fetch_snapshot.assert_called_once_with()
+                    load_local.assert_called_once_with("fallback.yaml")
+                    self.assertIsNone(provider._thread)
+                    on_update.assert_not_called()
+
+    def test_client_creation_failure_falls_back_to_yaml(self):
+        settings = self.settings()
+        factory = Mock(side_effect=NacosConfigError("Nacos server address is empty"))
+        provider = self.provider(settings, factory)
+        on_update = Mock()
+        with patch("app.core.config.nacos.load_config", return_value=self.local_config) as load_local:
+            loaded, source = provider.load("fallback.yaml")
+            provider.start_polling(on_update)
+        self.assertIs(loaded, self.local_config)
+        self.assertEqual(source["nacos_status"], "fallback")
+        self.assertTrue(source["nacos_enabled"])
+        self.assertFalse(source["nacos_polling"])
+        factory.assert_called_once_with(PROFILES[0], settings)
+        load_local.assert_called_once_with("fallback.yaml")
+        self.assertIsNone(provider._thread)
+        on_update.assert_not_called()
 
     def test_enabled_still_validates_selected_profile_and_timeouts(self):
         for values in ({"profiles": ()}, {"connect_timeout_seconds": 0},
