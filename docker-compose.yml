@@ -2,6 +2,8 @@ services:
   fooddetector:
     image: aliyun-docker-harbor-registry.cn-hangzhou.cr.aliyuncs.com/roki-ai/roki-ai-food-detector-model:2026110201
     container_name: food_detector
+    volumes:
+      - ./output:/app/output
     environment:
       # 空值使用 prod，任意非空值使用 test。
       - NACOS_ENV=${NACOS_ENV:-}
