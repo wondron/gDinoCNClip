@@ -1,6 +1,6 @@
 services:
   fooddetector:
-    image: aliyun-docker-harbor-registry.cn-hangzhou.cr.aliyuncs.com/roki-ai/roki-ai-food-detector-model:20261102   
+    image: aliyun-docker-harbor-registry.cn-hangzhou.cr.aliyuncs.com/roki-ai/roki-ai-food-detector-model:2026110201
     container_name: food_detector
     environment:
       # 空值使用 prod，任意非空值使用 test。
@@ -19,4 +19,3 @@ services:
         reservations:
           devices:
             - capabilities: [gpu]
-    runtime: nvidia          # 仅旧版 docker 需要，新版用 --gpus 会自动处理
