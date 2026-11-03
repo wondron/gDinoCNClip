@@ -23,7 +23,7 @@ async def food_detect(
     dino_box: float = Form(...),
     dino_text: float = Form(...),
     clip_cap: str = Form(...),
-    clip_thre: float = Form(..., le=1),
+    clip_thre: float = Form(...),
     save_result: bool = Form(False),
 ):
     if image is None or not image.content_type or not image.content_type.startswith("image/"):
