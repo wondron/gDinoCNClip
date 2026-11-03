@@ -1,0 +1,5 @@
+# Moore Threads S5000: install inside the ORT-MUSA image
+# (onnxruntime 1.23.0+musa, numpy 1.26.4 and opencv-python-headless 4.11 are already installed there).
+# Do NOT install requirements.txt in that image: onnxruntime-gpu would replace the MUSA build of onnxruntime.
+Pillow>=9.1
+tokenizers==0.20.3

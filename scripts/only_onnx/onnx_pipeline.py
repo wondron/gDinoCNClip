@@ -88,27 +88,45 @@ def _preload_windows_cuda():
         _CUDA_DLL_HANDLES.append(ctypes.WinDLL(str(files[name.lower()])))
 
 
-def create_session(model, provider="cuda", threads=0, *, device_id=0, log_severity_level=3):
-    """Create an ORT session. Unlike the service, a requested CUDA provider must load: no silent CPU fallback."""
+GPU_PROVIDERS = {"cuda": "CUDAExecutionProvider", "musa": "MUSAExecutionProvider"}
+LOAD_HINTS = {
+    "cuda": "on Linux start through run.sh so LD_LIBRARY_PATH contains the pip NVIDIA libraries",
+    "musa": "use the ORT-MUSA image (onnxruntime 1.23.0+musa) and do not install requirements.txt in it: "
+            "onnxruntime-gpu replaces the MUSA build",
+}
+
+
+def create_session(model, provider="cuda", threads=0, *, device_id=0, log_severity_level=3, profile_prefix=None):
+    """Create an ORT session. Unlike the service, a requested GPU provider must load: no silent CPU fallback.
+
+    With profile_prefix, ORT profiling is on until session.end_profiling() (see benchmark.node_placement).
+    """
     import onnxruntime as ort
 
-    if provider not in ("cpu", "cuda"):
-        raise ValueError("provider must be cpu or cuda")
+    if provider != "cpu" and provider not in GPU_PROVIDERS:
+        raise ValueError(f"provider must be cpu or one of {sorted(GPU_PROVIDERS)}")
     ort.set_default_logger_severity(log_severity_level)
     options = ort.SessionOptions()
     options.log_severity_level = log_severity_level
     if threads:
         options.intra_op_num_threads = threads
+    if profile_prefix:
+        options.enable_profiling = True
+        options.profile_file_prefix = str(profile_prefix)
     providers = ["CPUExecutionProvider"]
     if provider == "cuda":
         _preload_windows_cuda()
         # use_tf32=0 keeps FP32 scores stable near the thresholds and comparable across GPUs.
         providers.insert(0, ("CUDAExecutionProvider", {"device_id": str(device_id), "use_tf32": "0"}))
+    elif provider == "musa":
+        providers.insert(0, ("MUSAExecutionProvider", {"device_id": str(device_id)}))
+    if provider != "cpu" and GPU_PROVIDERS[provider] not in ort.get_available_providers():
+        raise RuntimeError(f"onnxruntime {ort.__version__} has no {GPU_PROVIDERS[provider]}; {LOAD_HINTS[provider]}. "
+                           f"Available providers: {ort.get_available_providers()}")
     session = ort.InferenceSession(str(model), sess_options=options, providers=providers)
-    if provider == "cuda" and session.get_providers()[0] != "CUDAExecutionProvider":
-        raise RuntimeError(
-            "CUDAExecutionProvider failed to load; on Linux start through run.sh so LD_LIBRARY_PATH "
-            f"contains the pip NVIDIA libraries. Active providers: {session.get_providers()}")
+    if provider != "cpu" and session.get_providers()[0] != GPU_PROVIDERS[provider]:
+        raise RuntimeError(f"{GPU_PROVIDERS[provider]} failed to load; {LOAD_HINTS[provider]}. "
+                           f"Active providers: {session.get_providers()}")
     return session
 
 

@@ -27,6 +27,8 @@ MAX_SCORE_DIFF = 0.005
 CASE_KEY = ("image", "dino_cap", "dino_box", "dino_text", "clip_cap", "clip_thre")
 SAME_SETTINGS = ("provider", "clip_provider", "threads", "warmup_runs", "timed_runs", "short_side",
                  "max_size", "max_text_len", "nms_threshold", "clip_detect_range")
+PLACEMENT_MODELS = {"gdino": ("GroundingDINO", "provider"), "clip_image": ("CLIP 图像", "clip_provider"),
+                    "clip_text": ("CLIP 文本", "clip_provider")}
 STAGE_NAMES = {
     "total_ms": "**端到端总耗时**", "decode_ms": "图片解码", "gdino_ms": "GroundingDINO 合计",
     "gdino_preprocess_ms": "└ 预处理", "gdino_infer_ms": "└ 推理 session.run",
@@ -122,6 +124,14 @@ def table(header, rows):
     return lines
 
 
+def setting(report, key):
+    value = report["settings"].get(key)
+    # CUDA vs MUSA is what a cross-vendor run compares; only GPU vs CPU makes the settings differ.
+    if key in ("provider", "clip_provider"):
+        return "cpu" if value == "cpu" else "gpu"
+    return value
+
+
 def environment_section(reports):
     def gpu(r, key):
         return (r["environment"].get("gpu") or {}).get(key, "—")
@@ -146,7 +156,7 @@ def environment_section(reports):
         changed = [name for name in base["models"] if base["models"][name]["sha256"] != r["models"].get(name, {}).get("sha256")]
         if changed:
             warnings.append(f"{r['tag']} 的模型文件与基准不同（SHA256）：{', '.join(changed)}，请确认复制完整")
-        changed = [key for key in SAME_SETTINGS if base["settings"].get(key) != r["settings"].get(key)]
+        changed = [key for key in SAME_SETTINGS if setting(base, key) != setting(r, key)]
         if changed:
             warnings.append(f"{r['tag']} 的评测设置与基准不同：{', '.join(changed)}")
     return lines + [""] + [f"> **注意**：{w}" for w in warnings]
@@ -173,6 +183,46 @@ def timing_section(reports):
     rows.append(["吞吐（张/秒，串行）"] + [cell(throughput(r), throughput(base), higher_is_better=True) for r in reports])
     return ["## 耗时汇总", "", "各用例中位数的平均，单位 ms；括号内为相对基准的加速比（>1 更快）。", ""] + \
         table(["阶段"] + [r["tag"] for r in reports], rows)
+
+
+def placement_section(reports):
+    """Nodes each GPU provider left on CPU, from benchmark.check_placement; empty for older reports."""
+    if not any(r.get("placement") for r in reports):
+        return []
+
+    def info(r, key):
+        if r["settings"].get(PLACEMENT_MODELS[key][1]) == "cpu":
+            return "CPU 推理"
+        p = (r.get("placement") or {}).get(key)
+        return "—" if p is None else "检查失败" if "error" in p else p
+
+    def nodes(p):
+        if isinstance(p, str):
+            return p
+        return f"{p['by_provider'].get('CPUExecutionProvider', 0)} / {p['nodes']}，Memcpy {p['memcpy']}，{p['cpu_ms']:.1f} ms"
+
+    def ops(p, base):
+        if isinstance(p, str):
+            return p
+        if base is None:
+            return ", ".join(f"{op}×{count}" for op, count in list(p["cpu_ops"].items())[:8]) or "无"
+        # Shape ops sit on CPU under every provider; list only what this server adds on top of the baseline.
+        base_ops = base["cpu_ops"] if isinstance(base, dict) else {}
+        extra = sorted(((op, count - base_ops.get(op, 0)) for op, count in p["cpu_ops"].items()
+                        if count > base_ops.get(op, 0)), key=lambda item: -item[1])
+        return "比基准多：" + ", ".join(f"{op}+{count}" for op, count in extra) if extra else "与基准相同"
+
+    rows = []
+    for key, (name, _) in PLACEMENT_MODELS.items():
+        base = info(reports[0], key)
+        rows.append([f"{name}：CPU 节点 / 总数"] + [nodes(info(r, key)) for r in reports])
+        rows.append([f"{name}：CPU 上的算子"] + [ops(base, None)] + [ops(info(r, key), base) for r in reports[1:]])
+    return ["## 算子分配", "",
+            "GPU provider 不支持的算子会留在 CPU 上执行，并通过 Memcpy 节点在显存和内存之间拷贝数据。"
+            "单元格为 CPU 节点数 / 总节点数、Memcpy 节点数、一次推理中 CPU 节点的耗时。"
+            "CUDA 也会主动把形状计算类的小算子放在 CPU 上，所以基准列列出最多的 8 种 CPU 算子，"
+            "其他列只列出比基准多的部分；完整列表见各 report.json 的 placement。", ""] + \
+        table(["模型"] + [r["tag"] for r in reports], rows) + [""]
 
 
 def case_tables(reports):
@@ -229,7 +279,7 @@ def main():
     case_lines, inconsistent = case_tables(reports)
     lines = ["# ONNX 推理服务器对比", "",
              f"生成于 {time.strftime('%Y-%m-%d %H:%M:%S')}，基准：**{reports[0]['tag']}**。", ""]
-    lines += environment_section(reports) + [""] + timing_section(reports) + [""] + case_lines
+    lines += environment_section(reports) + [""] + timing_section(reports) + [""] + placement_section(reports) + case_lines
     text = "\n".join(lines) + "\n"
     output = Path(args.output) if args.output else HERE / "output" / f"compare_{time.strftime('%Y%m%d_%H%M%S')}.md"
     output.parent.mkdir(parents=True, exist_ok=True)

@@ -1,5 +1,6 @@
-# ONNX-only benchmark, no PyTorch. Linux x86_64 GPU, Python 3.10/3.11; same pins as the project requirements.txt.
-# ONNX Runtime 1.19.2 uses CUDA 12.x and cuDNN 9.x.
+# ONNX-only benchmark, no PyTorch. NVIDIA GPU (e.g. H20), Linux x86_64, Python 3.10/3.11; same pins as the
+# project requirements.txt. ONNX Runtime 1.19.2 uses CUDA 12.x and cuDNN 9.x.
+# Moore Threads (MUSA) uses requirements-musa.txt instead.
 numpy==1.26.4
 Pillow>=9.1
 opencv-python-headless>=4.8,<4.12
