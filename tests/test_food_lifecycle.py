@@ -89,7 +89,7 @@ class FoodLifecycleChecks(unittest.TestCase):
         app, runtime = self._runtime()
         old_service = runtime.food_service
         changed = copy.deepcopy(self.config)
-        changed["CLIP_CONFIG"]["detect_range"] = [*changed["CLIP_CONFIG"]["detect_range"], "豆腐"]
+        changed["CLIP_CONFIG"]["food_range"] = [*changed["CLIP_CONFIG"]["food_range"], "豆腐"]
         new_clip = SimpleNamespace(ini_flag=True)
         with patch("app.domain.food_service.GdinoDetect") as build_dino, \
                 patch("app.domain.food_service.ClipDetect", return_value=new_clip) as build_clip:
@@ -128,23 +128,35 @@ class FoodLifecycleChecks(unittest.TestCase):
         self.assertIs(runtime.config, changed)
 
     def test_gdino_reload_keeps_both_endpoints_on_the_same_predictor(self):
-        # device_id 只影响 GroundingDINO 会话，同样只重建 DINO。
-        for section, field in (("GROUNDINGDINO_CONFIG", "short_side"), ("TOTAL_CONFIG", "device_id")):
-            with self.subTest(changed=f"{section}.{field}"):
-                app, runtime = self._runtime()
-                old_service = runtime.food_service
-                changed = copy.deepcopy(self.config)
-                changed[section][field] += 1
-                new_dino = Mock()
-                with patch("app.domain.food_service.GdinoDetect", return_value=new_dino) as build_dino, \
-                        patch("app.domain.food_service.ClipDetect") as build_clip:
-                    self.assertTrue(apply_nacos_config_update(app, self._snapshot(changed)))
-                build_dino.assert_called_once_with(changed)
-                build_clip.assert_not_called()
-                self.assertIs(runtime.predictor, new_dino)
-                self.assertIs(runtime.food_service.dino, new_dino)
-                self.assertIs(runtime.food_service.clip, old_service.clip)
-                self.assertIs(runtime.config, changed)
+        app, runtime = self._runtime()
+        old_service = runtime.food_service
+        changed = copy.deepcopy(self.config)
+        changed["GROUNDINGDINO_CONFIG"]["short_side"] += 1
+        new_dino = Mock()
+        with patch("app.domain.food_service.GdinoDetect", return_value=new_dino) as build_dino, \
+                patch("app.domain.food_service.ClipDetect") as build_clip:
+            self.assertTrue(apply_nacos_config_update(app, self._snapshot(changed)))
+        build_dino.assert_called_once_with(changed)
+        build_clip.assert_not_called()
+        self.assertIs(runtime.predictor, new_dino)
+        self.assertIs(runtime.food_service.dino, new_dino)
+        self.assertIs(runtime.food_service.clip, old_service.clip)
+        self.assertIs(runtime.config, changed)
+
+    def test_device_change_rebuilds_both_models(self):
+        # GroundingDINO 和 CLIP 都在 TOTAL_CONFIG.device_id 指定的 GPU 上。
+        app, runtime = self._runtime()
+        changed = copy.deepcopy(self.config)
+        changed["TOTAL_CONFIG"]["device_id"] += 1
+        new_dino, new_clip = Mock(), SimpleNamespace(ini_flag=True)
+        with patch("app.domain.food_service.GdinoDetect", return_value=new_dino) as build_dino, \
+                patch("app.domain.food_service.ClipDetect", return_value=new_clip) as build_clip:
+            self.assertTrue(apply_nacos_config_update(app, self._snapshot(changed)))
+        build_dino.assert_called_once_with(changed)
+        build_clip.assert_called_once_with(changed)
+        self.assertIs(runtime.food_service.dino, new_dino)
+        self.assertIs(runtime.food_service.clip, new_clip)
+        self.assertIs(runtime.config, changed)
 
 
 if __name__ == "__main__":

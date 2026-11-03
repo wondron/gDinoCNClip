@@ -19,13 +19,13 @@ only_onnx/
 
 ## H20 与 S5000 对比步骤
 
-两边都让 GroundingDINO 和 CLIP 跑在 GPU 上，比的才是 GPU。服务目前的 CLIP 实际跑在 CPU 上（见“说明”），如果要复现服务现状，再各跑一次不带 `--clip-provider` 的默认配置。
+CLIP 默认和 GroundingDINO 用同一个 provider（与服务一致），所以两边都只需要指定 `--provider`。
 
 ### H20（NVIDIA）
 
 ```bash
 python3 -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple   # 每台一次，Python 3.10/3.11，建议用独立 venv/conda
-bash run.sh --tag h20 --clip-provider cuda
+bash run.sh --tag h20
 ```
 
 需要 NVIDIA 驱动（`nvidia-smi` 能正常运行），不需要安装 CUDA Toolkit。`python3` 不是要用的解释器时：`PYTHON=/opt/conda/envs/onnx/bin/python bash run.sh ...`。
@@ -46,7 +46,7 @@ docker run --rm -it --env MTHREADS_VISIBLE_DEVICES=0 --shm-size 8g \
 python3 -c "import onnxruntime as o; print(o.__version__, o.get_available_providers())"
 # 应输出 1.23.0+musa.e82282d4 ['MUSAExecutionProvider', 'CPUExecutionProvider']
 python3 -m pip install -r requirements-musa.txt     # 只装 Pillow、tokenizers
-bash run.sh --tag s5000 --provider musa --clip-provider musa
+bash run.sh --tag s5000 --provider musa
 ```
 
 **不要在这个镜像里安装 `requirements.txt`**：其中的 `onnxruntime-gpu` 会覆盖 MUSA 版的 `onnxruntime`。如果已经装了，`pip uninstall onnxruntime-gpu` 后重新安装镜像自带的 MUSA wheel。
@@ -75,7 +75,7 @@ python3 compare.py output/h20_20261103_101000 output/s5000_20261103_103000
 |---|---|---|
 | `--tag` | 主机名 | 服务器名称，用在报告文件夹名和对比表头 |
 | `--provider` | cuda | GroundingDINO 的推理设备：`cuda` / `musa` / `cpu` |
-| `--clip-provider` | cpu | CLIP 的推理设备。**服务目前的 CLIP 实际跑在 CPU 上**，默认按这个情况测；`cuda` / `musa` 用于测 CLIP 跑在 GPU 上 |
+| `--clip-provider` | 同 `--provider` | CLIP 的推理设备，默认与服务一致；`cpu` 可以复现修复前服务把 CLIP 跑在 CPU 上的情况 |
 | `--device-id` | 0 | GPU 编号 |
 | `--runs` / `--warmup` | 20 / 3 | 计时次数 / 预热次数。只用 CPU 时可以改小，例如 `--runs 3` |
 | `--output-dir` | `output/` | 报告文件夹的上级目录 |
@@ -94,10 +94,10 @@ python3 compare.py output/h20_20261103_101000 output/s5000_20261103_103000
 
 ## 说明
 
-- 在 `app/domain/pipeline/b_clipdtct.py` 中，CLIP 的 providers 写成了 `["CPUExecutionProvider", "CUDAExecutionProvider"]`。ORT 按列表顺序分配算子，CPU 排在前面，所以整个 CLIP 都跑在 CPU 上。在 RTX 4060 笔记本上测得单张裁剪图耗时 78 ms，改用 CUDA 后为 6.7 ms。
-- 服务代码只认识 `CUDAExecutionProvider`。直接部署到 MUSA 镜像时，GroundingDINO 只会打一条警告就退回 CPU，CLIP 本来就在 CPU，也就是全部跑在 CPU 上。这里测出的 S5000 数据对应的是服务改成使用 `MUSAExecutionProvider` 之后的情况。
+- 服务的 CLIP 以前把 providers 写成 `["CPUExecutionProvider", "CUDAExecutionProvider"]`，CPU 排在前面，整个 CLIP 都跑在 CPU 上。现在已改为和 GroundingDINO 一样 CUDA 优先、使用同一块 GPU。在 RTX 4060 笔记本上，单张裁剪图从 78 ms 降到 6.7 ms。
+- 服务代码只认识 `CUDAExecutionProvider`。直接部署到 MUSA 镜像时，GroundingDINO 和 CLIP 都只会打一条警告就退回 CPU。这里测出的 S5000 数据对应的是服务改成使用 `MUSAExecutionProvider` 之后的情况。
 - NVIDIA 上所有 CUDA session 都使用 `use_tf32=0`（GroundingDINO 与服务一致），保证是 FP32 计算。MUSA 侧只传了 `device_id`，ORT-MUSA 默认是否使用 TF32 之类的低精度模式未知；如果“结果一致性”里 S5000 的分数差明显偏大，可能是这个原因。
 - 两边的 onnxruntime 版本不同（H20 1.19.2，与服务一致；ORT-MUSA 基于 1.23.0），报告的环境表里会列出。
 - `mthreads-gmi` 的输出格式没有公开约定，解析不到 GPU 名称时，原始输出保存在 `report.json` 的 `environment.gpu.raw` 中。
-- 如果 `clip_cap` 不在 `CLIP_DETECT_RANGE` 中（例如默认用例里的“食物”“豆腐”），服务会对每个框都重新跑一次 CLIP 文本模型。评测保留了这一行为，这部分耗时计入“文本推理”。
+- CLIP 的候选文本与 `config.yaml` 一致：`clip_cap` 属于 `CLIP_RECIPE_RANGE`（一道菜、食物）时只和 `CLIP_COMMON_RANGE` 比较，其他情况和食材 + 通用类别比较。`clip_cap` 不在任何范围内时（例如默认用例里的“豆腐”），每个请求会多跑一次 CLIP 文本模型，这部分耗时计入“文本推理”。修改 `config.yaml` 中的范围后，要同步修改 `benchmark.py` 顶部的三个范围。
 - `models/*.onnx` 已加入本目录的 `.gitignore`，避免把 1.4 GB 的模型提交到 git。请直接复制整个文件夹（`scp -r` / `rsync`）。

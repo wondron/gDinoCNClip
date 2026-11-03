@@ -26,7 +26,7 @@ MIN_IOU = 0.98
 MAX_SCORE_DIFF = 0.005
 CASE_KEY = ("image", "dino_cap", "dino_box", "dino_text", "clip_cap", "clip_thre")
 SAME_SETTINGS = ("provider", "clip_provider", "threads", "warmup_runs", "timed_runs", "short_side",
-                 "max_size", "max_text_len", "nms_threshold", "clip_detect_range")
+                 "max_size", "max_text_len", "nms_threshold", "clip_ranges")
 PLACEMENT_MODELS = {"gdino": ("GroundingDINO", "provider"), "clip_image": ("CLIP 图像", "clip_provider"),
                     "clip_text": ("CLIP 文本", "clip_provider")}
 STAGE_NAMES = {

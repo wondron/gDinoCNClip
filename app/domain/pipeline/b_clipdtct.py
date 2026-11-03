@@ -3,7 +3,6 @@ import logging
 import sys
 from pathlib import Path
 import numpy as np
-import onnxruntime as ort
 from typing import Dict, Any, List
 from PIL import Image
 
@@ -13,6 +12,7 @@ if __name__ == "__main__" and not __package__:
 
 from app.core.observability.log_helper import show_text
 from app.domain.common.image_utils import box2xyxy
+from app.domain.pipeline.a_gdinoDtct import create_session
 import app.domain.common.tokenizer as tokenizer
 
 logger = logging.getLogger("clip")
@@ -26,11 +26,19 @@ class ClipDetect:
         clip_cfg = config.get("CLIP_CONFIG", {})
         self.model_path = clip_cfg.get('imag_model_path', None)
         self.text_model_path = clip_cfg.get('text_model_path', None)
-        self.detect_range = clip_cfg.get('detect_range', [])
+        # 与 GroundingDINO 使用同一块 GPU。
+        self.device_id = config.get("TOTAL_CONFIG", {}).get("device_id", 0)
         self.threshold = clip_cfg.get('threshold', 0.02)
         self.logit_scale = clip_cfg.get('logit_scale', 100)
-        logger.info(f"检测范围：{self.detect_range}")
-        show_text(f"检测范围：{self.detect_range}")
+        self.test_image_path = clip_cfg.get('test_image_path', "")
+        self.recipe_range = clip_cfg.get('recipe_range', [])
+        self.common_range = clip_cfg.get('common_range', [])
+        self.food_range = clip_cfg.get('food_range', [])
+        
+        logger.info(f"通用检测范围：{self.common_range}")
+        logger.info(f"食材检测范围：{self.food_range}")
+        show_text(f"通用检测范围：{self.common_range}")
+        show_text(f"食材检测范围：{self.food_range}")
         self.init_model()
 
 
@@ -40,9 +48,10 @@ class ClipDetect:
             logger.warning("未检测到需要检测的范围食材！")
             return False
 
+        known = {**self.food_feat_dict, **self.common_feat_dict, **self.recipe_feat_dict}
         exclude_range = []
         for food in FoodList:
-            if food not in self.texts:
+            if food not in known:
                 exclude_range.append(food)
         if len(exclude_range) > 0:
             show_msg = "、".join(exclude_range)
@@ -55,58 +64,63 @@ class ClipDetect:
         t0 = time.time()
         dummy = np.zeros((self.shape[2], self.shape[3], self.shape[1]), dtype=np.uint8)
         for _ in range(max(1, runs)):
-            self.detect(dummy)
+            self.detect(dummy, "皮皮虾")
         logger.info("预热完成, 次数: %d, 耗时: %.2fs", runs, time.time() - t0)
-    
-
-    def get_providers(self):
-        available = ort.get_available_providers()
-        providers = ["CPUExecutionProvider"]
-        if "CUDAExecutionProvider" in available:
-            providers.append("CUDAExecutionProvider")
-        return providers
 
 
     def init_model(self):
         self.ini_flag = False
-        imagflag = self.load_image_model()
-        textmdlflag = self.load_text_model()
-        textflag = self.load_text_feature()
-        self.ini_flag = textflag and imagflag and textmdlflag
-
-        if not self.ini_flag:
-            logger.error("CLIP模型初始化失败！")
-            return
-
-        image_path = "config/images/pipixia.jpg"
-        image_bgr = cv2.imread(image_path)
-        isRight = self.detect(image_bgr, "皮皮虾")
-        if isRight:
-            logger.info('CLIP模型初始化完成！')
-        else:
-            logger.error('CLIP模型初始化失败！输入皮皮虾未和图像特征匹配！')
-    
-
-    def load_text_feature(self):
         try:
-            nameList = self.detect_range
-            self.texts = {}
+            if not (self.load_image_model() and self.load_text_model()):
+                logger.error("CLIP模型初始化失败！")
+                return
+            self.food_feat_dict = self.load_text_feature(self.food_range)
+            self.common_feat_dict = self.load_text_feature(self.common_range)
+            self.recipe_feat_dict = self.load_text_feature(self.recipe_range)
+            for name, feat_dict, text_range in (("food_range", self.food_feat_dict, self.food_range),
+                                                ("common_range", self.common_feat_dict, self.common_range),
+                                                ("recipe_range", self.recipe_feat_dict, self.recipe_range)):
+                if len(feat_dict) != len(set(text_range)):
+                    logger.error(f"CLIP模型初始化失败！{name} 的文本特征数量与配置不一致")
+                    return
+
+            image_bgr = cv2.imread(self.test_image_path)
+            if image_bgr is None:
+                logger.error(f"CLIP模型初始化失败！无法读取自检图片：{self.test_image_path}")
+                return
+            # detect() 要求 ini_flag 为 True：自检前先置位，失败再复位。
+            self.ini_flag = True
+            if self.detect(image_bgr, "皮皮虾") <= 0:
+                self.ini_flag = False
+                logger.error('CLIP模型初始化失败！输入皮皮虾未和图像特征匹配！')
+                return
+            logger.info('CLIP模型初始化完成！providers=%s', self.sess.get_providers())
+        except Exception as e:
+            self.ini_flag = False
+            logger.error(f"CLIP模型初始化失败！{e}")
+            show_text(f"CLIP模型初始化失败！{e}")
+
+
+
+    def load_text_feature(self, text_list):
+        try:
+            nameList = text_list
+            texts = {}
             if not len(nameList):
-                logger.error("未检测到需要检测的范围食材！")
-                return False
+                # 范围可以为空（例如不配置 recipe_range）。
+                return texts
 
             nameList, text_featureList = self.extract_text_feature(nameList)
             if len(text_featureList) == 0 or len(text_featureList) != len(nameList):
                 logger.error("未检测到需要检测的范围食材特征！")
-                return False
-
+                return texts
+            
             for idx, feature in enumerate(text_featureList):
-                self.texts[nameList[idx]] = feature
-
-            return True
+                texts[nameList[idx]] = feature
+            return texts
         except Exception as e:
             logger.error(f"加载CLIP文本特征文件失败！{e}")
-            return False
+            return {}
 
 
     def load_text_model(self):
@@ -114,10 +128,8 @@ class ClipDetect:
             if not os.path.exists(self.text_model_path):
                 logger.error(f"CLIP 文本模型文件：{self.text_model_path} 不存在！")
                 return False
-            providers = self.get_providers()
-            sess_opts = ort.SessionOptions()
-            sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-            self.text_sess = ort.InferenceSession(str(self.text_model_path), sess_opts, providers=providers)
+            # CUDA 优先，不可用时回退 CPU；以前 CPU 排在 CUDA 前面，整个 CLIP 实际都跑在 CPU 上。
+            self.text_sess = create_session(self.text_model_path, "cuda", device_id=self.device_id)
             self.text_input_name = self.text_sess.get_inputs()[0].name
             self.text_output_name = self.text_sess.get_outputs()[0].name
             self.text_shape = self.text_sess.get_inputs()[0].shape
@@ -135,10 +147,7 @@ class ClipDetect:
                 logger.error(f"CLIP 模型文件：{self.model_path} 不存在！")
                 return False
 
-            providers = self.get_providers()
-            sess_opts = ort.SessionOptions()
-            sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-            self.sess = ort.InferenceSession(str(self.model_path), sess_opts, providers=providers)
+            self.sess = create_session(self.model_path, "cuda", device_id=self.device_id)
 
             self.input_name = self.sess.get_inputs()[0].name
             self.output_name = self.sess.get_outputs()[0].name
@@ -190,12 +199,11 @@ class ClipDetect:
 
 
 
-    def extract_text_feature(self, text_list=None):
-        if text_list is None or len(text_list) == 0:
-            text_list = self.texts
+    def extract_text_feature(self, text_list):
+        empty = np.empty((0, 0), dtype=np.float32)
         if not text_list:
             logger.error("给定 text_list 中没有任何合法文本，返回空结果。")
-            return [], np.empty((0, self.feats.shape[1]), dtype=self.feats.dtype)
+            return [], empty
 
         seq_len = self.text_shape[1] if len(self.text_shape) > 1 else 52
         tokens_list = tokenizer.tokenize(text_list, context_length=seq_len) 
@@ -216,10 +224,10 @@ class ClipDetect:
                 output = np.stack(feat_list, axis=0)  # [N, dim]
             else:
                 logger.error(f"CLIP 文本模型 batch 维不匹配：模型期望 {expected_bs}，但输入是 {batch_size}。")
-                return [], np.empty((0, self.feats.shape[1]), dtype=self.feats.dtype)
+                return [], empty
         except Exception as e:
             logger.error(f"CLIP 文本模型推理失败: {e}")
-            return [], np.empty((0, self.feats.shape[1]), dtype=self.feats.dtype)
+            return [], empty
         output = output / (np.linalg.norm(output, axis=-1, keepdims=True) + 1e-7)
         return text_list, output
 
@@ -245,6 +253,10 @@ class ClipDetect:
                 return [], []
             if not isinstance(image, Image.Image):
                 raise TypeError("image 必须是 PIL 图片")
+            # 候选文本特征每个请求只准备一次，所有框共用。
+            candidates = self.text_candidates(clip_caption)
+            if candidates is None:
+                return [], []
             image = image.convert("RGB")
             width, height = image.size
 
@@ -257,7 +269,7 @@ class ClipDetect:
                 try:
                     crop_rgb = np.asarray(image.crop(rect))
                     crop_bgr = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2BGR)
-                    score = float(self.detect(crop_bgr, clip_caption))
+                    score = float(self.detect(crop_bgr, clip_caption, candidates))
                     if np.isfinite(score) and score > 0:
                         filtered_rects.append(rect)
                         confidences.append(score)
@@ -265,33 +277,56 @@ class ClipDetect:
                     logger.error("CLIP检测框 %s 判断失败：%s", rect, e)
             return filtered_rects, confidences
         except Exception as e:
+            show_text(f"CLIP批量检测失败：{e}")
             logger.error("CLIP批量检测失败：%s", e)
             return [], []
 
 
-    def detect(self, imgbgr: np.ndarray, input_name: str) -> float:
-        """Return the top score if input_name is the best match, otherwise 0.0."""
+    def text_candidates(self, input_name: str):
+        """返回 input_name 参与比较的 (候选文本列表, 特征矩阵)，失败返回 None。
+
+        菜品名（recipe_range）只和通用类别比较，其他文本和食材 + 通用类别比较；
+        预先算好的特征直接复用，不在任何范围内的文本现算一次。
+        """
+        if not isinstance(input_name, str) or not input_name.strip():
+            logger.error("input_name 必须是非空文本")
+            return None
+        if input_name in self.recipe_range:
+            pool = self.common_feat_dict
+        else:
+            pool = {**self.food_feat_dict, **self.common_feat_dict}
+        names, feats = list(pool), list(pool.values())
+        if input_name not in pool:
+            feat = self.recipe_feat_dict.get(input_name)
+            if feat is None:
+                _, new_feat = self.extract_text_feature([input_name])
+                if len(new_feat) == 0:
+                    return None
+                feat = new_feat[0]
+            names.append(input_name)
+            feats.append(feat)
+        return names, np.stack(feats)
+
+
+    def detect(self, imgbgr: np.ndarray, input_name: str, candidates=None) -> float:
+        """Return the top score if input_name is the best match, otherwise 0.0.
+
+        candidates: text_candidates(input_name) 的结果；batch_detect 传入以复用，不传时现算。
+        """
         if not self.ini_flag:
             logger.error("CLIP模型未初始化！")
             return 0.0
-        if not isinstance(input_name, str) or not input_name.strip():
-            logger.error("input_name 必须是非空文本")
-            return 0.0
+        if candidates is None:
+            candidates = self.text_candidates(input_name)
+            if candidates is None:
+                return 0.0
 
         img_feat = self.extract_image_feature(imgbgr)
         if img_feat is None:
             return 0.0
 
-        names = list(self.texts)
-        feats = list(self.texts.values())
-        if input_name not in self.texts:
-            _, new_feat = self.extract_text_feature([input_name])
-            if len(new_feat) == 0:
-                return 0.0
-            names.append(input_name)
-            feats.append(new_feat[0])
-
-        scores = np.stack(feats) @ img_feat[0]  # cosine similarities, shape [N]
+        names, feats = candidates
+        scores = feats @ img_feat[0]  # cosine similarities, shape [N]
         best = int(np.argmax(scores))
         logger.info("CLIP识别结果：输入=%s，最高分文本=%s，得分=%.4f",
                     input_name, names[best], scores[best])

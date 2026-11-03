@@ -39,6 +39,11 @@ def _gdino_config(config):
     return config.get("GROUNDINGDINO_CONFIG"), config.get("TOTAL_CONFIG", {}).get("device_id", 0)
 
 
+def _clip_config(config):
+    # CLIP 与 GroundingDINO 使用同一块 GPU，device_id 变化时也要重建。
+    return config.get("CLIP_CONFIG"), config.get("TOTAL_CONFIG", {}).get("device_id", 0)
+
+
 def _build_detector(config, *, dino=None, clip=None):
     # 传入的 dino/clip 是可复用的已加载组件，只加载缺少的模型。
     detector = Detector(config, dino=dino, clip=clip)
@@ -58,7 +63,7 @@ def apply_nacos_config_update(app, snapshot):
             _gdino_config(snapshot.config), _gdino_config(runtime.config),
         )
         reload_clip = current is None or not _same_config_value(
-            snapshot.config.get("CLIP_CONFIG"), runtime.config.get("CLIP_CONFIG"),
+            _clip_config(snapshot.config), _clip_config(runtime.config),
         )
         food_service = current
         if reload_dino or reload_clip:

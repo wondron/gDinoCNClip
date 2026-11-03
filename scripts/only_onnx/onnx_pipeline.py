@@ -378,11 +378,12 @@ def box2xyxy(image, boxes):
 
 
 class ChineseClip:
-    """ClipDetect equivalent: text features of detect_range are computed once at load time."""
+    """ClipDetect equivalent: text features of the food, common and recipe ranges are computed at load time."""
 
-    def __init__(self, image_model, text_model, detect_range, provider="cpu", device_id=0):
-        if not detect_range:
-            raise ValueError("detect_range must not be empty")
+    def __init__(self, image_model, text_model, food_range, common_range, recipe_range, provider="cuda",
+                 device_id=0):
+        if not food_range and not common_range:
+            raise ValueError("food_range and common_range must not both be empty")
         self.image_session = create_session(image_model, provider, device_id=device_id)
         self.text_session = create_session(text_model, provider, device_id=device_id)
         self.input_name = self.image_session.get_inputs()[0].name
@@ -391,7 +392,10 @@ class ChineseClip:
         self.text_input_name = self.text_session.get_inputs()[0].name
         self.text_output_name = self.text_session.get_outputs()[0].name
         self.text_shape = self.text_session.get_inputs()[0].shape
-        self.texts = dict(zip(detect_range, self.extract_text_feature(detect_range)))
+        self.recipe_range = list(recipe_range)
+        self.food_feats, self.common_feats, self.recipe_feats = (
+            dict(zip(names, self.extract_text_feature(list(names)))) if names else {}
+            for names in (food_range, common_range, recipe_range))
 
     def extract_image_feature(self, img_bgr, timings=None):
         img = cv2.resize(img_bgr, (self.shape[2], self.shape[3]), interpolation=cv2.INTER_CUBIC)
@@ -413,16 +417,27 @@ class ChineseClip:
                 output = self.text_session.run([self.text_output_name], {self.text_input_name: tokens})[0]
         return output / (np.linalg.norm(output, axis=-1, keepdims=True) + 1e-7)
 
-    def detect(self, img_bgr, input_name, timings=None):
+    def text_candidates(self, input_name, timings=None):
+        """(names, feature matrix) input_name competes with: recipes only against common_range, others
+        against food + common; a caption outside every range is encoded once per request."""
+        if input_name in self.recipe_range:
+            pool = self.common_feats
+        else:
+            pool = {**self.food_feats, **self.common_feats}
+        names, feats = list(pool), list(pool.values())
+        if input_name not in pool:
+            feat = self.recipe_feats.get(input_name)
+            if feat is None:
+                feat = self.extract_text_feature([input_name], timings)[0]
+            names.append(input_name)
+            feats.append(feat)
+        return names, np.stack(feats)
+
+    def detect(self, img_bgr, input_name, candidates, timings=None):
         """Return the top cosine score if input_name is the best match, otherwise 0.0."""
         img_feat = self.extract_image_feature(img_bgr, timings)
-        names = list(self.texts)
-        feats = list(self.texts.values())
-        if input_name not in self.texts:
-            # The service encodes an out-of-range caption again for every crop.
-            names.append(input_name)
-            feats.append(self.extract_text_feature([input_name], timings)[0])
-        scores = np.stack(feats) @ img_feat[0]
+        names, feats = candidates
+        scores = feats @ img_feat[0]
         best = int(np.argmax(scores))
         return float(scores[best]) if names[best] == input_name else 0.0
 
@@ -430,6 +445,9 @@ class ChineseClip:
         """Crop normalized cxcywh boxes; return pixel xyxy rects whose best CLIP match is clip_caption."""
         boxes = np.asarray(boxes, dtype=np.float32).reshape(-1, 4)
         boxes = boxes[np.isfinite(boxes).all(axis=1) & (boxes[:, 2:] > 0).all(axis=1)]
+        if not len(boxes):
+            return [], []
+        candidates = self.text_candidates(clip_caption, timings)
         width, height = image.size
         rects, confidences = [], []
         for rect in box2xyxy(image, boxes):
@@ -437,7 +455,7 @@ class ChineseClip:
             if x2 <= x1 or y2 <= y1 or x2 <= 0 or y2 <= 0 or x1 >= width or y1 >= height:
                 continue
             crop_bgr = cv2.cvtColor(np.asarray(image.crop(rect)), cv2.COLOR_RGB2BGR)
-            score = self.detect(crop_bgr, clip_caption, timings)
+            score = self.detect(crop_bgr, clip_caption, candidates, timings)
             if np.isfinite(score) and score > 0:
                 rects.append(rect)
                 confidences.append(score)

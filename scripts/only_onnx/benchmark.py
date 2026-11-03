@@ -6,7 +6,7 @@ untimed runs and TIMED_RUNS timed runs; every stage is reported as median/mean/p
 
 Edit the settings below if needed, then run from any directory:
     bash run.sh [--tag NAME]                   # Linux: puts the pip CUDA libraries on LD_LIBRARY_PATH first
-    bash run.sh --provider musa --clip-provider musa   # Moore Threads, inside the ORT-MUSA image
+    bash run.sh --provider musa                # Moore Threads, inside the ORT-MUSA image
     python benchmark.py [--tag NAME]           # Windows, or when LD_LIBRARY_PATH is already set
 
 Writes output/<tag>_<timestamp>/report.json and, with SAVE_VIS, one overlay per case under vis/
@@ -45,9 +45,7 @@ CLIP_TEXT_MODEL = HERE / "models/clip/clip_cn_vit-b-16.txt.fp32.onnx"
 IMAGES = [HERE / "images"]  # image files and/or folders (non-recursive)
 OUTPUT_DIR = HERE / "output"
 PROVIDER = "cuda"  # GroundingDINO: "cuda" (NVIDIA), "musa" (Moore Threads) or "cpu"
-# The service lists CPU before CUDA for CLIP (b_clipdtct.get_providers), so CLIP runs on CPU there.
-# "cpu" reproduces that; "cuda" / "musa" measures CLIP on the GPU.
-CLIP_PROVIDER = "cpu"
+CLIP_PROVIDER = None  # None: same as PROVIDER, as in the service; "cpu" keeps CLIP on CPU
 DEVICE_ID = 0
 THREADS = 4  # GroundingDINO intra-op threads, as GROUNDINGDINO_CONFIG.threads
 # The values below match config/param/config.yaml.
@@ -55,9 +53,11 @@ SHORT_SIDE = 800
 MAX_SIZE = 1333
 MAX_TEXT_LEN = 256
 NMS_THRESHOLD = 0.5
-CLIP_DETECT_RANGE = ["水泥", "猫", "狗", "无食材", "猪肉", "鱼", "螃蟹", "鱿鱼", "蘑菇", "人", "皮皮虾"]
+CLIP_FOOD_RANGE = ["猪肉", "鱼", "螃蟹", "鱿鱼", "蘑菇", "皮皮虾"]
+CLIP_COMMON_RANGE = ["水泥", "猫", "狗", "无食材", "人"]
+CLIP_RECIPE_RANGE = ["一道菜", "食物"]  # these clip_cap values compete only with CLIP_COMMON_RANGE
 # /food_detect/ form fields: (dino_cap, dino_box, dino_text, clip_cap, clip_thre). A clip_cap outside
-# CLIP_DETECT_RANGE makes the service run the CLIP text model again for every box.
+# every range (e.g. 豆腐) makes the service run the CLIP text model once more per request.
 CASES = [
     ("food", 0.3, 0.4, "食物", 0.5),
     ("tofu . pickled vegetable . plate .", 0.35, 0.25, "豆腐", 0.5),
@@ -260,7 +260,8 @@ def main():
     parser.add_argument("--tag", default=platform.node(), help="server label for the report (default: hostname)")
     parser.add_argument("--provider", choices=("cuda", "musa", "cpu"), default=PROVIDER,
                         help="GroundingDINO provider")
-    parser.add_argument("--clip-provider", choices=("cuda", "musa", "cpu"), default=CLIP_PROVIDER)
+    parser.add_argument("--clip-provider", choices=("cuda", "musa", "cpu"), default=CLIP_PROVIDER,
+                        help="CLIP provider (default: same as --provider)")
     parser.add_argument("--device-id", type=int, default=DEVICE_ID)
     parser.add_argument("--warmup", type=int, default=WARMUP_RUNS)
     parser.add_argument("--runs", type=int, default=TIMED_RUNS)
@@ -269,6 +270,7 @@ def main():
     args = parser.parse_args()
     if args.warmup < 0 or args.runs < 1:
         parser.error("--warmup must be >= 0 and --runs >= 1")
+    args.clip_provider = args.clip_provider or args.provider
 
     images = list_images()
     cases = [(path, {"image": path.name, **dict(zip(CASE_FIELDS, case))}) for path in images for case in CASES]
@@ -287,7 +289,8 @@ def main():
                          SHORT_SIDE, MAX_SIZE, MAX_TEXT_LEN, NMS_THRESHOLD)
     load_ms = {"gdino": round((time.perf_counter() - started) * 1000, 2)}
     started = time.perf_counter()
-    clip = ChineseClip(CLIP_IMAGE_MODEL, CLIP_TEXT_MODEL, CLIP_DETECT_RANGE, args.clip_provider, args.device_id)
+    clip = ChineseClip(CLIP_IMAGE_MODEL, CLIP_TEXT_MODEL, CLIP_FOOD_RANGE, CLIP_COMMON_RANGE, CLIP_RECIPE_RANGE,
+                       args.clip_provider, args.device_id)
     load_ms["clip"] = round((time.perf_counter() - started) * 1000, 2)
     providers = {"gdino": dino.session.get_providers()[0], "clip": clip.image_session.get_providers()[0]}
     print(f"模型加载 GroundingDINO {load_ms['gdino']:.0f} ms, CLIP {load_ms['clip']:.0f} ms | {providers}", flush=True)
@@ -339,7 +342,9 @@ def main():
         "settings": {"provider": args.provider, "clip_provider": args.clip_provider, "device_id": args.device_id,
                      "threads": THREADS, "warmup_runs": args.warmup, "timed_runs": args.runs,
                      "short_side": SHORT_SIDE, "max_size": MAX_SIZE, "max_text_len": MAX_TEXT_LEN,
-                     "nms_threshold": NMS_THRESHOLD, "clip_detect_range": CLIP_DETECT_RANGE,
+                     "nms_threshold": NMS_THRESHOLD,
+                     "clip_ranges": {"food": CLIP_FOOD_RANGE, "common": CLIP_COMMON_RANGE,
+                                     "recipe": CLIP_RECIPE_RANGE},
                      "timing": "per case: median/mean/p90/min/max over timed runs; summary: mean of case medians"},
         "summary": summary, "cases": report_cases}
     target = run_dir / "report.json"

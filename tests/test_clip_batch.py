@@ -16,6 +16,8 @@ class ClipBatchChecks(unittest.TestCase):
         self.detector = ClipDetect.__new__(ClipDetect)
         self.detector.ini_flag = True
         self.detector.detect = Mock(return_value=0.25)
+        self.candidates = (["fish"], np.ones((1, 2), dtype=np.float32))
+        self.detector.text_candidates = Mock(return_value=self.candidates)
         self.box = np.array([[0.5, 0.5, 0.4, 0.5]], dtype=np.float32)
         logger = patch("app.domain.pipeline.b_clipdtct.logger")
         self.addCleanup(logger.stop)
@@ -30,11 +32,14 @@ class ClipBatchChecks(unittest.TestCase):
         self.assertEqual(rects, [[3, 2, 7, 6]])
         self.assertEqual(scores, [0.25])
         self.detector.detect.assert_called_once()
-        crop, caption = self.detector.detect.call_args.args
+        crop, caption, candidates = self.detector.detect.call_args.args
         np.testing.assert_array_equal(crop, self.pixels[2:6, 3:7, ::-1])
         self.assertTrue(crop.flags.c_contiguous)
         self.assertEqual(crop.dtype, np.uint8)
         self.assertEqual(caption, "fish")
+        # Text candidates are built once per batch and shared by every crop.
+        self.detector.text_candidates.assert_called_once_with("fish")
+        self.assertIs(candidates, self.candidates)
 
     def test_positive_scores_below_threshold_remain_in_original_order(self):
         boxes = [[0.5, 0.5, 0.4, 0.5], [0.8, 0.25, 0.2, 0.5],
