@@ -1,0 +1,4 @@
+# Models are ~1.4 GB: copy the folder to servers instead of committing them.
+*.onnx
+output/
+__pycache__/

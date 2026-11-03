@@ -1,0 +1,14 @@
+# ONNX-only benchmark, no PyTorch. Linux x86_64 GPU, Python 3.10/3.11; same pins as the project requirements.txt.
+# ONNX Runtime 1.19.2 uses CUDA 12.x and cuDNN 9.x.
+numpy==1.26.4
+Pillow>=9.1
+opencv-python-headless>=4.8,<4.12
+tokenizers==0.20.3
+onnxruntime-gpu==1.19.2
+
+# NVIDIA shared libraries for Linux; run.sh puts them on LD_LIBRARY_PATH.
+nvidia-cuda-runtime-cu12==12.4.127
+nvidia-cublas-cu12==12.4.5.8
+nvidia-cudnn-cu12==9.1.0.70
+nvidia-cufft-cu12==11.0.2.54
+nvidia-curand-cu12==10.3.5.147

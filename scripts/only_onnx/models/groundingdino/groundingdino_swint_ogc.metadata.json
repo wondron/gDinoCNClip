@@ -1,0 +1,30 @@
+{
+  "batch_size": 1,
+  "dynamic_axes": [
+    "height",
+    "width",
+    "tokens"
+  ],
+  "opset": 17,
+  "max_text_len": 256,
+  "image_preprocessing": {
+    "color": "RGB",
+    "short_side": 800,
+    "max_size": 1333,
+    "mean": [
+      0.485,
+      0.456,
+      0.406
+    ],
+    "std": [
+      0.229,
+      0.224,
+      0.225
+    ]
+  },
+  "outputs": {
+    "pred_logits": "raw logits; padded token positions are -inf",
+    "pred_boxes": "normalized cxcywh"
+  },
+  "torch_version": "2.5.1+cu118"
+}
