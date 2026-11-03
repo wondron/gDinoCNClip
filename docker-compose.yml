@@ -1,12 +1,12 @@
 services:
   fooddetector:
-    image: aliyun-docker-harbor-registry.cn-hangzhou.cr.aliyuncs.com/roki-ai/roki-ai-food-detector-model:2026110201
+    image: aliyun-docker-harbor-registry.cn-hangzhou.cr.aliyuncs.com/roki-ai/roki-ai-food-detector-model:2026110301
     container_name: food_detector
     volumes:
       - ./output:/app/output
     environment:
       # 空值使用 prod，任意非空值使用 test。
-      - NACOS_ENV=${NACOS_ENV:-}
+      - NACOS_ENV=test
       # 宿主机设置此变量则直接读取本地 YAML（包括空值）；未设置则读取 Nacos。
       # 也可直接改为 NACOS_USE_LOCAL=1；不要给未设置的变量填默认空值。
       - NACOS_USE_LOCAL
