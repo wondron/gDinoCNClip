@@ -20,13 +20,12 @@ LOGGER_NAME = "roki_ai_food_detector"
 LOG_LEVEL = "INFO"
 ORT_LOG_SEVERITY_LEVEL = 3  # ORT 原生日志：0详细、1信息、2警告、3错误、4致命
 LOG_SAVE_TO_FILE = True
-LOG_SAVE_K8S_FILE = False  # True 时额外向 stdout 输出平台 JSON 日志
+LOG_SAVE_K8S_FILE = True  # True 时额外向 stdout 输出平台 JSON 日志
 LOG_BACKUP_COUNT = 15
 LOG_TIMEZONE_OFFSET_HOURS = 8  # 与参考项目 Asia/Shanghai 一致，无需 tzdata
 OUTPUT_DIR = "output"
 SAVE_RESULT_DIR = "output/save_res"  # 接口 save_result=true 时保存标注结果图
 SAVE_IMAGES_DIR = "output/images"  # 兼容旧配置，HTTP 不再保存上传图片
-SAVE_IMAGES_ENABLED = False  # 兼容旧配置，HTTP 保存由请求参数 save_result 控制
 JPEG_QUALITY = 95
 
 DEFAULT_TIME_OUT = 180.0
