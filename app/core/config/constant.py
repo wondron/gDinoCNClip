@@ -26,6 +26,7 @@ LOG_TIMEZONE_OFFSET_HOURS = 8  # 与参考项目 Asia/Shanghai 一致，无需 t
 OUTPUT_DIR = "output"
 SAVE_RESULT_DIR = "output/save_res"  # 接口 save_result=true 时保存标注结果图
 SAVE_IMAGES_DIR = "output/images"  # 兼容旧配置，HTTP 不再保存上传图片
+SAVE_IMAGES_ENABLED = False  # 兼容旧配置，HTTP 保存由请求参数 save_result 控制
 JPEG_QUALITY = 95
 
 DEFAULT_TIME_OUT = 180.0
