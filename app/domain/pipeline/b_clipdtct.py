@@ -26,7 +26,6 @@ class ClipDetect:
         clip_cfg = config.get("CLIP_CONFIG", {})
         self.model_path = clip_cfg.get('imag_model_path', None)
         self.text_model_path = clip_cfg.get('text_model_path', None)
-        # 与 GroundingDINO 使用同一块 GPU。
         self.device_id = config.get("TOTAL_CONFIG", {}).get("device_id", 0)
         self.threshold = clip_cfg.get('threshold', 0.02)
         self.logit_scale = clip_cfg.get('logit_scale', 100)
@@ -34,14 +33,13 @@ class ClipDetect:
         self.recipe_range = clip_cfg.get('recipe_range', [])
         self.common_range = clip_cfg.get('common_range', [])
         self.food_range = clip_cfg.get('food_range', [])
-        
+        logger.info(f"菜谱检测范围: {self.recipe_range}")
         logger.info(f"通用检测范围：{self.common_range}")
         logger.info(f"食材检测范围：{self.food_range}")
+        show_text(f"菜谱检测范围: {self.recipe_range}")
         show_text(f"通用检测范围：{self.common_range}")
         show_text(f"食材检测范围：{self.food_range}")
         self.init_model()
-
-
 
     def isRangeInFeatures(self, FoodList:List):
         if len(FoodList) == 0:
@@ -88,7 +86,6 @@ class ClipDetect:
             if image_bgr is None:
                 logger.error(f"CLIP模型初始化失败！无法读取自检图片：{self.test_image_path}")
                 return
-            # detect() 要求 ini_flag 为 True：自检前先置位，失败再复位。
             self.ini_flag = True
             if self.detect(image_bgr, "皮皮虾") <= 0:
                 self.ini_flag = False
@@ -107,14 +104,11 @@ class ClipDetect:
             nameList = text_list
             texts = {}
             if not len(nameList):
-                # 范围可以为空（例如不配置 recipe_range）。
                 return texts
-
             nameList, text_featureList = self.extract_text_feature(nameList)
             if len(text_featureList) == 0 or len(text_featureList) != len(nameList):
                 logger.error("未检测到需要检测的范围食材特征！")
                 return texts
-            
             for idx, feature in enumerate(text_featureList):
                 texts[nameList[idx]] = feature
             return texts
@@ -122,13 +116,11 @@ class ClipDetect:
             logger.error(f"加载CLIP文本特征文件失败！{e}")
             return {}
 
-
     def load_text_model(self):
         try:
             if not os.path.exists(self.text_model_path):
                 logger.error(f"CLIP 文本模型文件：{self.text_model_path} 不存在！")
                 return False
-            # CUDA 优先，不可用时回退 CPU；以前 CPU 排在 CUDA 前面，整个 CLIP 实际都跑在 CPU 上。
             self.text_sess = create_session(self.text_model_path, "cuda", device_id=self.device_id)
             self.text_input_name = self.text_sess.get_inputs()[0].name
             self.text_output_name = self.text_sess.get_outputs()[0].name
@@ -140,22 +132,17 @@ class ClipDetect:
             logger.error(f"加载CLIP文本模型失败！{e}")
             return False
 
-
     def load_image_model(self):
         try:
             if not os.path.exists(self.model_path):
                 logger.error(f"CLIP 模型文件：{self.model_path} 不存在！")
                 return False
-
             self.sess = create_session(self.model_path, "cuda", device_id=self.device_id)
-
             self.input_name = self.sess.get_inputs()[0].name
             self.output_name = self.sess.get_outputs()[0].name
             self.shape = self.sess.get_inputs()[0].shape
-
             logger.info(f'clip imgs 输入名：{self.input_name}')
             logger.info(f'clip imgs 输出名：{self.output_name}')
-
             return True
         except Exception as e:
             logger.error(f"加载CLIP模型失败！{e}")
@@ -196,8 +183,6 @@ class ClipDetect:
         except Exception as e:
             logger.error(f"CLIP模型输入图片处理失败！{e}")
             return None
-
-
 
     def extract_text_feature(self, text_list):
         empty = np.empty((0, 0), dtype=np.float32)
