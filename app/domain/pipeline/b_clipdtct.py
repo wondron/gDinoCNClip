@@ -268,11 +268,6 @@ class ClipDetect:
 
 
     def text_candidates(self, input_name: str):
-        """返回 input_name 参与比较的 (候选文本列表, 特征矩阵)，失败返回 None。
-
-        菜品名（recipe_range）只和通用类别比较，其他文本和食材 + 通用类别比较；
-        预先算好的特征直接复用，不在任何范围内的文本现算一次。
-        """
         if not isinstance(input_name, str) or not input_name.strip():
             logger.error("input_name 必须是非空文本")
             return None
@@ -294,10 +289,6 @@ class ClipDetect:
 
 
     def detect(self, imgbgr: np.ndarray, input_name: str, candidates=None) -> float:
-        """Return the top score if input_name is the best match, otherwise 0.0.
-
-        candidates: text_candidates(input_name) 的结果；batch_detect 传入以复用，不传时现算。
-        """
         if not self.ini_flag:
             logger.error("CLIP模型未初始化！")
             return 0.0
@@ -311,10 +302,11 @@ class ClipDetect:
             return 0.0
 
         names, feats = candidates
+        logger.info("CLIP检测输入：%s，候选数量=%d，候选文本=%s", input_name, len(names), names)
+        show_text(f"CLIP检测输入：{input_name}，候选数量={len(names)}, {names}")
         scores = feats @ img_feat[0]  # cosine similarities, shape [N]
         best = int(np.argmax(scores))
-        logger.info("CLIP识别结果：输入=%s，最高分文本=%s，得分=%.4f",
-                    input_name, names[best], scores[best])
+        logger.info("CLIP识别结果：输入=%s，最高分文本=%s，得分=%.4f", input_name, names[best], scores[best])
         return float(scores[best]) if names[best] == input_name else 0.0
 
 
@@ -322,7 +314,6 @@ if __name__ == '__main__':
     from app.core.config.loader import load_config
     from app.core.config.settings import local_path
     from app.core.observability.logging import setup_logger
-
     setup_logger()
     config = load_config()
     clip = ClipDetect(config)
